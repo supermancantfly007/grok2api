@@ -3,7 +3,11 @@ name: grok2api
 services:
   grok2api:
     container_name: grok2api
-    image: "${GROK2API_IMAGE:-ghcr.io/chenyme/grok2api:latest}"
+    # 默认用本地代码构建；如需临时用现成镜像可设置 GROK2API_IMAGE=xxx
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: "${GROK2API_IMAGE:-grok2api:local}"
     ports:
       - "${GROK2API_PORT:-8000}:8000"
     environment:
