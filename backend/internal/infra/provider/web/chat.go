@@ -163,9 +163,13 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 					continue
 				}
 			}
+			upstreamURL := statsigTarget
+			if upstream.Request != nil && upstream.Request.URL != nil {
+				upstreamURL = upstream.Request.URL.String()
+			}
 			return &provider.Response{
 				StatusCode: upstream.StatusCode, Status: upstream.Status, Header: http.Header(upstream.Header),
-				UpstreamURL: upstream.Request.URL.String(),
+				UpstreamURL: upstreamURL,
 				Body: &releaseBody{ReadCloser: upstream.Body, release: func() {
 					a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, upstream.StatusCode, nil)
 					lease.Release()

@@ -52,10 +52,10 @@ func (c *browserClient) Do(request *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fromFHTTPResponse(fresponse), nil
+	return fromFHTTPResponse(fresponse, request), nil
 }
 
-func fromFHTTPResponse(fresponse *fhttp.Response) *http.Response {
+func fromFHTTPResponse(fresponse *fhttp.Response, request *http.Request) *http.Response {
 	header := http.Header(fresponse.Header).Clone()
 	contentLength := fresponse.ContentLength
 	if fresponse.Uncompressed {
@@ -70,6 +70,7 @@ func fromFHTTPResponse(fresponse *fhttp.Response) *http.Response {
 		Body: fresponse.Body, ContentLength: contentLength, TransferEncoding: transferEncoding,
 		// fhttp 在读取 Body 到 EOF 时原地填充 Trailer，因此这里必须保留共享 map。
 		Close: fresponse.Close, Uncompressed: fresponse.Uncompressed, Trailer: http.Header(fresponse.Trailer),
+		Request: request,
 	}
 }
 

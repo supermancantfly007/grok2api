@@ -53,7 +53,7 @@ func TestFromFHTTPResponseNormalizesAutoDecompressedHeaders(t *testing.T) {
 			"Content-Type":     []string{"application/json"},
 		},
 		Body: io.NopCloser(strings.NewReader(`{"status":"completed"}`)), ContentLength: 128, Uncompressed: true,
-	})
+	}, nil)
 	if response.Header.Get("Content-Encoding") != "" || response.Header.Get("Content-Length") != "" {
 		t.Fatalf("decoded response headers = %#v", response.Header)
 	}
@@ -71,7 +71,7 @@ func TestFromFHTTPResponsePreservesCompressedHeaders(t *testing.T) {
 		Status: "200 OK", StatusCode: http.StatusOK,
 		Header: fhttp.Header{"Content-Encoding": []string{"gzip"}, "Content-Length": []string{"128"}},
 		Body:   io.NopCloser(bytes.NewReader(nil)), ContentLength: 128,
-	})
+	}, nil)
 	if response.Header.Get("Content-Encoding") != "gzip" || response.Header.Get("Content-Length") != "128" || response.ContentLength != 128 {
 		t.Fatalf("compressed response = headers=%#v contentLength=%d", response.Header, response.ContentLength)
 	}
@@ -85,7 +85,7 @@ func TestFromFHTTPResponseOwnsHeadersAndPreservesDeferredTrailers(t *testing.T) 
 		TransferEncoding: []string{"chunked"},
 		Body:             io.NopCloser(bytes.NewReader(nil)),
 	}
-	response := fromFHTTPResponse(source)
+	response := fromFHTTPResponse(source, nil)
 
 	source.Header.Set("X-Upstream", "mutated")
 	source.TransferEncoding[0] = "identity"

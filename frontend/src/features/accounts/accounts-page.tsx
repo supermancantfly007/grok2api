@@ -87,7 +87,7 @@ export function AccountsPage() {
   const importToastRef = useRef<string | number | null>(null);
   const [provider, setProvider] = useState<AccountProvider>("grok_build");
   const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(20);
+  const [pageSize, setPageSize] = useState(100);
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");

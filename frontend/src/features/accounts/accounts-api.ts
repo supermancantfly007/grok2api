@@ -240,7 +240,41 @@ export type WebConsoleSyncInput = BuildConversionInput;
 export type AccountTaskProgressDTO = {
   completed: number;
   total: number;
-  phase?: "importing" | "converting" | "syncing";
+  phase?: "importing" | "converting" | "syncing" | "probing";
+};
+
+export type HealthProbeStatus =
+  | "healthy"
+  | "unauthorized"
+  | "payment"
+  | "forbidden"
+  | "rate_limited"
+  | "network"
+  | "error"
+  | "unknown";
+
+export type HealthProbeItemDTO = {
+  accountId: string;
+  name: string;
+  email?: string;
+  enabled: boolean;
+  httpStatus: number;
+  status: HealthProbeStatus;
+  error?: string;
+  elapsedMs: number;
+};
+
+export type HealthProbeSummaryDTO = {
+  total: number;
+  healthy: number;
+  unauthorized: number;
+  payment: number;
+  forbidden: number;
+  rateLimited: number;
+  network: number;
+  error: number;
+  unknown: number;
+  items: HealthProbeItemDTO[];
 };
 
 export type AccountImportResultDTO = {
@@ -250,15 +284,36 @@ export type AccountImportResultDTO = {
   syncFailed: number;
 };
 
-type AccountTaskStreamPayload = Partial<BuildConversionResultDTO & AccountTaskProgressDTO & AccountTokenRefreshResultDTO & AccountImportResultDTO> & {
+type AccountTaskStreamPayload = Partial<BuildConversionResultDTO & AccountTaskProgressDTO & AccountTokenRefreshResultDTO & AccountImportResultDTO & Omit<HealthProbeSummaryDTO, "error" | "items">> & {
   code?: string;
   message?: string;
+  accountId?: string;
+  name?: string;
+  email?: string;
+  enabled?: boolean;
+  httpStatus?: number;
+  status?: HealthProbeStatus;
+  // result 事件为字符串详情；complete 汇总里为 error 计数（数字）
+  error?: string | number;
+  elapsedMs?: number;
+  items?: HealthProbeItemDTO[];
 };
 
+const isStringOrNumber: (value: unknown) => boolean = (value) => typeof value === "string" || (typeof value === "number" && Number.isFinite(value));
+const healthProbeStatusValidator = isOneOf("healthy", "unauthorized", "payment", "forbidden", "rate_limited", "network", "error", "unknown");
+const healthProbeItemValidator = hasShape({
+  accountId: isString, name: isString, email: isOptional(isString), enabled: isBoolean, httpStatus: isNumber,
+  status: healthProbeStatusValidator, error: isOptional(isString), elapsedMs: isNumber,
+});
 const decodeAccountTaskStreamPayload = createObjectDecoder<AccountTaskStreamPayload>("account task event", {
   created: isOptional(isNumber), linked: isOptional(isNumber), skipped: isOptional(isNumber), failed: isOptional(isNumber),
   synced: isOptional(isNumber), syncFailed: isOptional(isNumber), completed: isOptional(isNumber), total: isOptional(isNumber),
-  phase: isOptional(isOneOf("importing", "converting", "syncing")), updated: isOptional(isNumber), succeeded: isOptional(isNumber),
+  phase: isOptional(isOneOf("importing", "converting", "syncing", "probing")), updated: isOptional(isNumber), succeeded: isOptional(isNumber),
+  healthy: isOptional(isNumber), unauthorized: isOptional(isNumber), payment: isOptional(isNumber), forbidden: isOptional(isNumber),
+  rateLimited: isOptional(isNumber), network: isOptional(isNumber), error: isOptional(isStringOrNumber), unknown: isOptional(isNumber),
+  items: isOptional(isArrayOf(healthProbeItemValidator)),
+  accountId: isOptional(isString), name: isOptional(isString), email: isOptional(isString), enabled: isOptional(isBoolean),
+  httpStatus: isOptional(isNumber), status: isOptional(healthProbeStatusValidator), elapsedMs: isOptional(isNumber),
   code: isOptional(isString), message: isOptional(isString),
 });
 
@@ -308,7 +363,7 @@ async function runAccountTask<T>(path: string, body: BodyInit | object | undefin
       signal,
     }, decodeAccountTaskStreamPayload, ({ event, data }) => {
       if (event === "progress" && typeof data.completed === "number" && typeof data.total === "number") {
-        const phase = data.phase === "importing" || data.phase === "converting" || data.phase === "syncing" ? data.phase : undefined;
+        const phase = data.phase === "importing" || data.phase === "converting" || data.phase === "syncing" || data.phase === "probing" ? data.phase : undefined;
         reportProgress({ completed: data.completed, total: data.total, phase });
         return;
       }
@@ -338,6 +393,99 @@ export function refreshAllAccountBilling(onProgress?: (value: AccountTaskProgres
 
 export function refreshAllAccountTokens(onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountTokenRefreshResultDTO> {
   return runAccountTask("/api/admin/v1/accounts/refresh-tokens", undefined, ["succeeded", "failed", "skipped"], onProgress, signal);
+}
+
+export async function probeBuildAccountHealth(
+  onProgress?: (value: AccountTaskProgressDTO) => void,
+  onResult?: (item: HealthProbeItemDTO) => void,
+  signal?: AbortSignal,
+): Promise<HealthProbeSummaryDTO> {
+  let result: HealthProbeSummaryDTO | undefined;
+  let pendingProgress: AccountTaskProgressDTO | undefined;
+  let progressTimer: number | undefined;
+  let lastProgressAt = 0;
+  const flushProgress = () => {
+    if (!pendingProgress || !onProgress) return;
+    const value = pendingProgress;
+    pendingProgress = undefined;
+    lastProgressAt = performance.now();
+    onProgress(value);
+  };
+  const reportProgress = (value: AccountTaskProgressDTO) => {
+    pendingProgress = value;
+    const delay = Math.max(0, 100 - (performance.now() - lastProgressAt));
+    if (delay === 0) {
+      if (progressTimer !== undefined) window.clearTimeout(progressTimer);
+      progressTimer = undefined;
+      flushProgress();
+    } else if (progressTimer === undefined) {
+      progressTimer = window.setTimeout(() => {
+        progressTimer = undefined;
+        flushProgress();
+      }, delay);
+    }
+  };
+  try {
+    await apiEventStream("/api/admin/v1/accounts/probe-health", {
+      method: "POST",
+      headers: { Accept: "text/event-stream" },
+      signal,
+    }, decodeAccountTaskStreamPayload, ({ event, data }) => {
+      if (event === "progress" && typeof data.completed === "number" && typeof data.total === "number") {
+        reportProgress({ completed: data.completed, total: data.total, phase: data.phase === "probing" ? "probing" : "probing" });
+        return;
+      }
+      if (event === "result" && typeof data.accountId === "string" && typeof data.name === "string" && typeof data.status === "string" && typeof data.httpStatus === "number" && typeof data.enabled === "boolean" && typeof data.elapsedMs === "number") {
+        onResult?.({
+          accountId: data.accountId,
+          name: data.name,
+          email: data.email,
+          enabled: data.enabled,
+          httpStatus: data.httpStatus,
+          status: data.status,
+          error: typeof data.error === "string" ? data.error : undefined,
+          elapsedMs: data.elapsedMs,
+        });
+        return;
+      }
+      if (event === "complete") {
+        flushProgress();
+        if (
+          hasNumericResult(data, ["total", "healthy", "unauthorized", "payment", "forbidden", "rateLimited", "network", "unknown"])
+          && typeof data.error === "number"
+          && Number.isInteger(data.error)
+          && data.error >= 0
+          && Array.isArray(data.items)
+        ) {
+          result = {
+            total: data.total as number,
+            healthy: data.healthy as number,
+            unauthorized: data.unauthorized as number,
+            payment: data.payment as number,
+            forbidden: data.forbidden as number,
+            rateLimited: data.rateLimited as number,
+            network: data.network as number,
+            error: data.error,
+            unknown: data.unknown as number,
+            items: data.items,
+          };
+        }
+        return;
+      }
+
+      if (event === "error") {
+        const code = data.code ?? "accountHealthProbeFailed";
+        throw new ApiError(502, code, i18n.exists(`apiErrors.${code}`) ? i18n.t(`apiErrors.${code}`) : (data.message ?? i18n.t("apiErrors.requestFailed")));
+      }
+    });
+  } finally {
+    if (progressTimer !== undefined) window.clearTimeout(progressTimer);
+    flushProgress();
+  }
+  if (!result) {
+    throw new ApiError(502, "invalidResponse", i18n.t("apiErrors.invalidResponse"));
+  }
+  return result;
 }
 
 export function refreshAllWebAccountQuotas(onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountBatchResultDTO> {
