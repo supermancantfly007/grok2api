@@ -11,6 +11,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { EgressNodes } from "@/features/settings/egress-nodes";
+import { VersionUpdateSection } from "@/features/system/version-update";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { isByteSizeUnit, isDurationUnit, type ByteSizeValue, type DurationValue } from "@/features/settings/settings-model";
 import { useSettings } from "@/features/settings/use-settings";
@@ -69,6 +70,7 @@ export function SettingsPage() {
             <TabsTrigger value="providers">{t("settings.groups.providers")}</TabsTrigger>
             <TabsTrigger value="delivery">{t("settings.groups.delivery")}</TabsTrigger>
             <TabsTrigger value="policies">{t("settings.groups.policies")}</TabsTrigger>
+            <TabsTrigger value="about">{t("settings.groups.about")}</TabsTrigger>
           </TabsList>
 
           <SettingsPane value="providers">
@@ -164,6 +166,14 @@ export function SettingsPage() {
           </SettingsPane>
 
           <SettingsPane value="policies">
+          <SettingsSection title={t("settings.server.title")}>
+            <div className="grid gap-x-4 gap-y-5 sm:grid-cols-2">
+              <SettingsField controlId="server-max-concurrent-requests" label={t("settings.server.maxConcurrentRequests")} description={t("settings.server.maxConcurrentRequestsHelp")} error={form.formState.errors.server?.maxConcurrentRequests?.message}>
+                <Input id="server-max-concurrent-requests" type="number" min={1} max={100_000} {...form.register("server.maxConcurrentRequests", { valueAsNumber: true })} />
+              </SettingsField>
+            </div>
+          </SettingsSection>
+
           <SettingsSection title={t("settings.batch.title")}>
             <div className="grid gap-x-4 gap-y-5 sm:grid-cols-2">
               <SettingsField controlId="batch-import-concurrency" label={t("settings.batch.importConcurrency")} error={form.formState.errors.batch?.importConcurrency?.message}><Input id="batch-import-concurrency" type="number" min={1} max={50} {...form.register("batch.importConcurrency", { valueAsNumber: true })} /></SettingsField>
@@ -198,6 +208,10 @@ export function SettingsPage() {
               <SettingsField controlId="client-key-default-concurrency" label={t("settings.clientKeys.maxConcurrent")} error={form.formState.errors.clientKeyDefaults?.maxConcurrent?.message}><Input id="client-key-default-concurrency" type="number" min={1} max={1_024} {...form.register("clientKeyDefaults.maxConcurrent", { valueAsNumber: true })} /></SettingsField>
             </div>
           </SettingsSection>
+          </SettingsPane>
+
+          <SettingsPane value="about">
+            <VersionUpdateSection />
           </SettingsPane>
         </Tabs>
       ) : null}

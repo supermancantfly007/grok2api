@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
@@ -32,6 +33,8 @@ var (
 	ErrConversionBusy = errors.New("账号正在转换为 Grok Build")
 )
 
+var ErrCredentialRefreshPermanent = errors.New("OAuth refresh token 已永久失效")
+
 const (
 	estimatedFreeTokenLimit     int64         = 1_000_000
 	freeUsageWindow             time.Duration = 24 * time.Hour
@@ -50,7 +53,10 @@ const (
 	credentialImportChunkSize                 = 100
 	maxBuildConversionAccounts                = 1000
 	maxWebConsoleSyncAccounts                 = 1000
+	accountTaskBatchSize                      = 1000
 )
+
+const permanentRefreshExpiredReason = "OAuth refresh token 已永久失效且 access token 已过期"
 
 type webQuotaRefreshState struct {
 	pending bool
@@ -103,11 +109,13 @@ type View struct {
 }
 
 type UpdateInput struct {
-	Name             *string
-	Enabled          *bool
-	Priority         *int
-	MaxConcurrent    *int
-	MinimumRemaining *float64
+	Name                   *string
+	Enabled                *bool
+	Priority               *int
+	MaxConcurrent          *int
+	MinimumRemaining       *float64
+	CloudflareCookies      *string
+	ClearCloudflareCookies bool
 }
 
 type DeviceStartResult struct {
@@ -122,8 +130,23 @@ type DeviceStartResult struct {
 type ImportResult struct {
 	Created    int
 	Updated    int
+	Skipped    int
 	AccountIDs []uint64
 }
+
+type BuildConversionStrategy string
+
+const (
+	BuildConversionAll     BuildConversionStrategy = "all"
+	BuildConversionMissing BuildConversionStrategy = "missing"
+)
+
+type WebConsoleSyncStrategy string
+
+const (
+	WebConsoleSyncAll     WebConsoleSyncStrategy = "all"
+	WebConsoleSyncMissing WebConsoleSyncStrategy = "missing"
+)
 
 type ImportedAccountObserver func(accountID uint64) error
 
@@ -731,9 +754,25 @@ func (s *Service) persistImportedSeeds(ctx context.Context, seeds []provider.Cre
 
 // SyncWebAccountsToConsoleWithProgress 使用 Web 账号的同一份 SSO 创建或更新 Console 账号。
 func (s *Service) SyncWebAccountsToConsoleWithProgress(ctx context.Context, ids []uint64, observer ImportedAccountObserver, progress BatchProgressObserver) (ImportResult, error) {
+	return s.SyncWebAccountsToConsoleWithStrategy(ctx, ids, WebConsoleSyncAll, observer, progress)
+}
+
+func (s *Service) SyncWebAccountsToConsoleWithStrategy(ctx context.Context, ids []uint64, strategy WebConsoleSyncStrategy, observer ImportedAccountObserver, progress BatchProgressObserver) (ImportResult, error) {
+	if strategy != WebConsoleSyncAll && strategy != WebConsoleSyncMissing {
+		return ImportResult{}, invalidInput("Grok Web 到 Console 同步策略无效")
+	}
 	ids, err := normalizeIDs(ids, maxWebConsoleSyncAccounts)
 	if err != nil {
 		return ImportResult{}, err
+	}
+	if strategy == WebConsoleSyncMissing {
+		values, err := s.accounts.ListMissingConsoleSyncAccounts(ctx, ids)
+		if err != nil {
+			return ImportResult{}, mapRepositoryError(err)
+		}
+		result, err := s.syncWebCredentialsToConsole(ctx, values, observer, progress)
+		result.Skipped = len(ids) - len(values)
+		return result, err
 	}
 	values := make([]accountdomain.Credential, 0, len(ids))
 	for _, id := range ids {
@@ -748,17 +787,60 @@ func (s *Service) SyncWebAccountsToConsoleWithProgress(ctx context.Context, ids 
 
 // SyncAllWebAccountsToConsoleWithProgress 同步完整 Web 号池，避免前端分页遗漏账号。
 func (s *Service) SyncAllWebAccountsToConsoleWithProgress(ctx context.Context, observer ImportedAccountObserver, progress BatchProgressObserver) (ImportResult, error) {
-	values, total, err := s.accounts.List(ctx, repository.AccountListQuery{
-		Page:   repository.PageQuery{Limit: maxWebConsoleSyncAccounts + 1},
-		Filter: repository.AccountListFilter{Provider: string(accountdomain.ProviderWeb)},
-	})
-	if err != nil {
-		return ImportResult{}, err
+	return s.SyncAllWebAccountsToConsoleWithStrategy(ctx, WebConsoleSyncAll, observer, progress)
+}
+
+func (s *Service) SyncAllWebAccountsToConsoleWithStrategy(ctx context.Context, strategy WebConsoleSyncStrategy, observer ImportedAccountObserver, progress BatchProgressObserver) (ImportResult, error) {
+	if strategy != WebConsoleSyncAll && strategy != WebConsoleSyncMissing {
+		return ImportResult{}, invalidInput("Grok Web 到 Console 同步策略无效")
 	}
-	if total > maxWebConsoleSyncAccounts || len(values) > maxWebConsoleSyncAccounts {
-		return ImportResult{}, invalidInput("Grok Web 账号超过 1000 个，请分批勾选同步")
+	batchSize := accountTaskBatchSize
+	result := ImportResult{AccountIDs: make([]uint64, 0)}
+	var afterID uint64
+	completed := 0
+	total := 0
+	initialized := false
+	for {
+		var (
+			values  []accountdomain.Credential
+			count   int64
+			skipped int64
+			err     error
+		)
+		if strategy == WebConsoleSyncMissing {
+			values, count, skipped, err = s.accounts.ListMissingConsoleSyncBatch(ctx, afterID, batchSize)
+		} else {
+			values, count, err = s.accounts.ListProviderAccountBatch(ctx, accountdomain.ProviderWeb, afterID, batchSize)
+		}
+		if err != nil {
+			return result, err
+		}
+		if !initialized {
+			total = int(count)
+			result.Skipped = int(skipped)
+			initialized = true
+			if progress != nil {
+				if err := progress(0, total); err != nil {
+					return result, err
+				}
+			}
+		}
+		if len(values) == 0 {
+			return result, nil
+		}
+		current, err := s.syncWebCredentialsToConsole(ctx, values, observer, offsetBatchProgress(progress, completed, total))
+		result.Created += current.Created
+		result.Updated += current.Updated
+		result.AccountIDs = append(result.AccountIDs, current.AccountIDs...)
+		if err != nil {
+			return result, err
+		}
+		completed += len(values)
+		afterID = values[len(values)-1].ID
+		if len(values) < batchSize {
+			return result, nil
+		}
 	}
-	return s.syncWebCredentialsToConsole(ctx, values, observer, progress)
 }
 
 func (s *Service) syncWebCredentialsToConsole(ctx context.Context, values []accountdomain.Credential, observer ImportedAccountObserver, progress BatchProgressObserver) (ImportResult, error) {
@@ -786,6 +868,13 @@ func (s *Service) syncWebCredentialsToConsole(ctx context.Context, values []acco
 		seed.Provider = accountdomain.ProviderConsole
 		seed.AuthType = accountdomain.AuthTypeSSO
 		seed.Name = webConsoleAccountName(value.Name, seed.Name)
+		if strings.TrimSpace(value.EncryptedCloudflareCookie) != "" {
+			cookies, decryptErr := s.cipher.Decrypt(value.EncryptedCloudflareCookie)
+			if decryptErr != nil {
+				return ImportResult{}, fmt.Errorf("解密 Grok Web Cloudflare Cookie: %w", decryptErr)
+			}
+			seed.CloudflareCookies = cookies
+		}
 		seeds = append(seeds, seed)
 	}
 	return s.persistImportedSeeds(ctx, seeds, observer, progress)
@@ -804,52 +893,142 @@ func webConsoleAccountName(webName, fallback string) string {
 
 // ConvertWebAccountsToBuild 使用 Web SSO 自动完成 xAI Device Flow，并建立唯一的 Web/Build 账号关联。
 func (s *Service) ConvertWebAccountsToBuild(ctx context.Context, ids []uint64) (BuildConversionResult, error) {
-	return s.ConvertWebAccountsToBuildWithObserver(ctx, ids, nil)
+	return s.ConvertWebAccountsToBuildWithStrategy(ctx, ids, BuildConversionMissing, nil, nil)
 }
 
 func (s *Service) ConvertWebAccountsToBuildWithObserver(ctx context.Context, ids []uint64, observer ImportedAccountObserver) (BuildConversionResult, error) {
-	return s.ConvertWebAccountsToBuildWithProgress(ctx, ids, observer, nil)
+	return s.ConvertWebAccountsToBuildWithStrategy(ctx, ids, BuildConversionMissing, observer, nil)
 }
 
 // ConvertWebAccountsToBuildWithProgress 转换指定账号，并向调用方报告真实完成数。
 func (s *Service) ConvertWebAccountsToBuildWithProgress(ctx context.Context, ids []uint64, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
+	return s.ConvertWebAccountsToBuildWithStrategy(ctx, ids, BuildConversionMissing, observer, progress)
+}
+
+func (s *Service) ConvertWebAccountsToBuildWithStrategy(ctx context.Context, ids []uint64, strategy BuildConversionStrategy, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
+	if strategy != BuildConversionAll && strategy != BuildConversionMissing {
+		return BuildConversionResult{}, invalidInput("Grok Web 到 Build 转换策略无效")
+	}
 	ids, err := normalizeIDs(ids, maxBuildConversionAccounts)
 	if err != nil {
 		return BuildConversionResult{}, err
 	}
-	return s.convertWebAccountsToBuild(ctx, ids, observer, progress)
+	prefilteredSkipped := 0
+	if strategy == BuildConversionMissing {
+		candidates, err := s.accounts.FilterMissingBuildConversionIDs(ctx, ids)
+		if err != nil {
+			return BuildConversionResult{}, mapRepositoryError(err)
+		}
+		prefilteredSkipped = len(ids) - len(candidates)
+		ids = candidates
+	}
+	result, err := s.convertWebAccountsToBuild(ctx, ids, strategy, observer, progress)
+	result.Skipped += prefilteredSkipped
+	return result, err
 }
 
 // ConvertAllWebAccountsToBuild 转换全部尚未建立 Build 关联的 Grok Web 账号。
 func (s *Service) ConvertAllWebAccountsToBuild(ctx context.Context) (BuildConversionResult, error) {
-	return s.ConvertAllWebAccountsToBuildWithObserver(ctx, nil)
+	return s.ConvertAllWebAccountsToBuildWithStrategy(ctx, BuildConversionMissing, nil, nil)
 }
 
 func (s *Service) ConvertAllWebAccountsToBuildWithObserver(ctx context.Context, observer ImportedAccountObserver) (BuildConversionResult, error) {
-	return s.ConvertAllWebAccountsToBuildWithProgress(ctx, observer, nil)
+	return s.ConvertAllWebAccountsToBuildWithStrategy(ctx, BuildConversionMissing, observer, nil)
 }
 
 // ConvertAllWebAccountsToBuildWithProgress 转换完整未关联号池，并向调用方报告真实完成数。
 func (s *Service) ConvertAllWebAccountsToBuildWithProgress(ctx context.Context, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
-	ids, err := s.accounts.ListUnlinkedWebAccountIDs(ctx, maxBuildConversionAccounts+1)
-	if err != nil {
-		return BuildConversionResult{}, err
-	}
-	if len(ids) > maxBuildConversionAccounts {
-		return BuildConversionResult{}, invalidInput("未关联账号超过 1000 个，请分批勾选转换")
-	}
-	if len(ids) == 0 {
-		if progress != nil {
-			if err := progress(0, 0); err != nil {
-				return BuildConversionResult{}, err
-			}
-		}
-		return BuildConversionResult{}, nil
-	}
-	return s.convertWebAccountsToBuild(ctx, ids, observer, progress)
+	return s.ConvertAllWebAccountsToBuildWithStrategy(ctx, BuildConversionMissing, observer, progress)
 }
 
-func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
+func (s *Service) ConvertAllWebAccountsToBuildWithStrategy(ctx context.Context, strategy BuildConversionStrategy, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
+	if strategy != BuildConversionAll && strategy != BuildConversionMissing {
+		return BuildConversionResult{}, invalidInput("Grok Web 到 Build 转换策略无效")
+	}
+	batchSize := accountTaskBatchSize
+	result := BuildConversionResult{BuildAccountIDs: make([]uint64, 0)}
+	seenBuildIDs := make(map[uint64]struct{})
+	var observed sync.Map
+	batchObserver := observer
+	if observer != nil {
+		batchObserver = func(accountID uint64) error {
+			if _, loaded := observed.LoadOrStore(accountID, struct{}{}); loaded {
+				return nil
+			}
+			return observer(accountID)
+		}
+	}
+	var afterID uint64
+	completed := 0
+	total := 0
+	initialized := false
+	for {
+		var (
+			ids   []uint64
+			count int64
+			err   error
+		)
+		if strategy == BuildConversionMissing {
+			ids, count, err = s.accounts.ListUnlinkedWebAccountIDs(ctx, afterID, batchSize)
+		} else {
+			var values []accountdomain.Credential
+			values, count, err = s.accounts.ListProviderAccountBatch(ctx, accountdomain.ProviderWeb, afterID, batchSize)
+			ids = make([]uint64, 0, len(values))
+			for _, value := range values {
+				ids = append(ids, value.ID)
+			}
+		}
+		if err != nil {
+			return result, err
+		}
+		if !initialized {
+			total = int(count)
+			initialized = true
+			if progress != nil {
+				if err := progress(0, total); err != nil {
+					return result, err
+				}
+			}
+		}
+		if len(ids) == 0 {
+			return result, nil
+		}
+		current, err := s.convertWebAccountsToBuild(ctx, ids, strategy, batchObserver, offsetBatchProgress(progress, completed, total))
+		result.Created += current.Created
+		result.Linked += current.Linked
+		result.Skipped += current.Skipped
+		result.Failed += current.Failed
+		for _, buildID := range current.BuildAccountIDs {
+			if _, exists := seenBuildIDs[buildID]; exists {
+				continue
+			}
+			seenBuildIDs[buildID] = struct{}{}
+			result.BuildAccountIDs = append(result.BuildAccountIDs, buildID)
+		}
+		if err != nil {
+			return result, err
+		}
+		completed += len(ids)
+		afterID = ids[len(ids)-1]
+		if len(ids) < batchSize {
+			return result, nil
+		}
+	}
+}
+
+func offsetBatchProgress(progress BatchProgressObserver, offset, total int) BatchProgressObserver {
+	if progress == nil {
+		return nil
+	}
+	return func(completed, _ int) error {
+		if completed == 0 {
+			return nil
+		}
+		return progress(offset+completed, total)
+	}
+}
+
+func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, strategy BuildConversionStrategy, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
 	if progress != nil {
 		if err := progress(0, len(ids)); err != nil {
 			return BuildConversionResult{}, err
@@ -869,7 +1048,7 @@ func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, o
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	results, summary, runErr := batch.MapObserved(runCtx, ids, batch.Options{Workers: s.conversionPool.Limit(), Pool: s.conversionPool}, func(workCtx context.Context, id uint64) (outcome, error) {
-		buildID, created, skipped, convertErr := s.convertWebAccountToBuild(workCtx, id)
+		buildID, created, skipped, convertErr := s.convertWebAccountToBuild(workCtx, id, strategy)
 		return outcome{accountID: id, buildID: buildID, created: created, skipped: skipped, err: convertErr}, nil
 	}, func(_ int, execution batch.Result[outcome]) {
 		observerMu.Lock()
@@ -934,7 +1113,7 @@ func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, o
 	return result, nil
 }
 
-func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64) (uint64, bool, bool, error) {
+func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strategy BuildConversionStrategy) (uint64, bool, bool, error) {
 	value, err := s.accounts.Get(ctx, id)
 	if err != nil {
 		return 0, false, false, mapRepositoryError(err)
@@ -942,7 +1121,7 @@ func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64) (uint
 	if value.Provider != accountdomain.ProviderWeb || value.AuthType != accountdomain.AuthTypeSSO {
 		return 0, false, false, ErrUnsupported
 	}
-	if value.LinkedAccountID != 0 {
+	if value.LinkedAccountID != 0 && strategy == BuildConversionMissing {
 		return value.LinkedAccountID, false, true, nil
 	}
 	release, acquired, err := s.refreshLock.Acquire(ctx, "web-build-conversion:"+strconv.FormatUint(id, 10), 2*time.Minute)
@@ -957,8 +1136,19 @@ func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64) (uint
 	if err != nil {
 		return 0, false, false, mapRepositoryError(err)
 	}
-	if value.LinkedAccountID != 0 {
+	if value.LinkedAccountID != 0 && strategy == BuildConversionMissing {
 		return value.LinkedAccountID, false, true, nil
+	}
+	linkedBuildSourceKey := ""
+	if value.LinkedAccountID != 0 {
+		linkedBuild, getErr := s.accounts.Get(ctx, value.LinkedAccountID)
+		if getErr != nil {
+			return 0, false, false, mapRepositoryError(getErr)
+		}
+		if linkedBuild.Provider != accountdomain.ProviderBuild || strings.TrimSpace(linkedBuild.SourceKey) == "" {
+			return 0, false, false, fmt.Errorf("已关联 Grok Build 账号身份无效")
+		}
+		linkedBuildSourceKey = linkedBuild.SourceKey
 	}
 	converter, ok := s.providers.BuildConverter(accountdomain.ProviderWeb)
 	if !ok {
@@ -973,9 +1163,15 @@ func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64) (uint
 	}
 	seed.Provider = accountdomain.ProviderBuild
 	seed.AuthType = accountdomain.AuthTypeOAuth
+	if linkedBuildSourceKey != "" {
+		seed.SourceKey = linkedBuildSourceKey
+	}
 	buildAccount, created, err := s.persistSeed(ctx, seed)
 	if err != nil {
 		return 0, false, false, err
+	}
+	if value.LinkedAccountID != 0 && buildAccount.ID != value.LinkedAccountID {
+		return 0, false, false, fmt.Errorf("重新转换后的 Grok Build 账号身份不一致")
 	}
 	if err := s.accounts.LinkWebToBuild(ctx, id, buildAccount.ID); err != nil {
 		return 0, false, false, mapRepositoryError(err)
@@ -1056,6 +1252,27 @@ func (s *Service) Update(ctx context.Context, id uint64, input UpdateInput) (Vie
 		}
 		value.MinimumRemaining = *input.MinimumRemaining
 	}
+	if input.ClearCloudflareCookies {
+		value.EncryptedCloudflareCookie = ""
+	} else if input.CloudflareCookies != nil {
+		if value.Provider == accountdomain.ProviderBuild {
+			return View{}, invalidInput("Grok Build 账号不使用 Cloudflare Cookie")
+		}
+		if len(*input.CloudflareCookies) > 16<<10 {
+			return View{}, invalidInput("Cloudflare Cookie 不能超过 16 KiB")
+		}
+		if strings.TrimSpace(*input.CloudflareCookies) != "" {
+			cookies := egressapp.SanitizeCloudflareCookies(*input.CloudflareCookies)
+			if cookies == "" {
+				return View{}, invalidInput("Cloudflare Cookie 中没有有效字段")
+			}
+			encrypted, encryptErr := s.cipher.Encrypt(cookies)
+			if encryptErr != nil {
+				return View{}, encryptErr
+			}
+			value.EncryptedCloudflareCookie = encrypted
+		}
+	}
 	updated, err := s.accounts.Update(ctx, value)
 	if err != nil {
 		return View{}, mapRepositoryError(err)
@@ -1108,6 +1325,9 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 		return value, nil
 	}
 	now := s.now()
+	if credential, err, handled := s.resolvePermanentRefreshFailure(ctx, value, now, force); handled {
+		return credential, err
+	}
 	if !force && value.ExpiresAt.IsZero() && value.EncryptedAccessToken != "" {
 		return value, nil
 	}
@@ -1124,6 +1344,12 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 			return nil, err
 		}
 		currentTime := s.now()
+		if credential, err, handled := s.resolvePermanentRefreshFailure(ctx, latest, currentTime, force); handled {
+			if err != nil {
+				return nil, err
+			}
+			return credential, nil
+		}
 		if respectSchedule && latest.RefreshDueAt != nil && latest.RefreshDueAt.After(currentTime) {
 			return latest, nil
 		}
@@ -1147,6 +1373,12 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 				return nil, err
 			}
 			currentTime = s.now()
+			if credential, err, handled := s.resolvePermanentRefreshFailure(ctx, latest, currentTime, force); handled {
+				if err != nil {
+					return nil, err
+				}
+				return credential, nil
+			}
 			if respectSchedule && latest.RefreshDueAt != nil && latest.RefreshDueAt.After(currentTime) {
 				return latest, nil
 			}
@@ -1272,13 +1504,24 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 	} else if errors.Is(refreshErr, context.DeadlineExceeded) {
 		errorCode = "oauth_timeout"
 	}
+	// 永久失败只能由成功换取新 token 清除，后续偶发传输错误不能把状态降级为可重试。
+	permanent = permanent || credential.RefreshPermanent
 	now := s.now()
 	retryAt := now.Add(credentialRefreshBackoff(credential.ID, failureCount, retryAfter))
-	if permanent {
+	accessTokenAlive := credential.EncryptedAccessToken != "" && !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(now)
+	if permanent && accessTokenAlive {
+		// refresh token 已永久失效时，提前重试没有意义；到 access token 到期时再完成失效收敛。
+		retryAt = credential.ExpiresAt
+	} else if permanent {
 		retryAt = now
 	}
-	if err := s.accounts.UpdateCredentialRefreshFailure(ctx, credential.ID, failureCount, retryAt, errorCode); err != nil {
+	if err := s.accounts.UpdateCredentialRefreshFailure(ctx, credential.ID, failureCount, retryAt, errorCode, permanent); err != nil {
 		s.logger.Warn("credential_refresh_state_write_failed", "account_id", credential.ID, "error", err)
+	}
+	if permanent && accessTokenAlive {
+		s.logger.Warn("credential_refresh_permanent_but_token_alive", "account_id", credential.ID, "error_code", errorCode, "expires_at", credential.ExpiresAt, "retry_at", retryAt)
+		s.WakeCredentialRefresh()
+		return
 	}
 	if permanent {
 		if err := s.MarkReauthRequired(ctx, credential.ID, "OAuth refresh failed: "+errorCode); err != nil {
@@ -1288,6 +1531,26 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 	}
 	s.logger.Warn("credential_refresh_deferred", "account_id", credential.ID, "failure_count", failureCount, "retry_at", retryAt, "error_code", errorCode)
 	s.WakeCredentialRefresh()
+}
+
+// resolvePermanentRefreshFailure 阻止再次请求已确认失效的 refresh token，并在 access token 到期后收敛账号状态。
+func (s *Service) resolvePermanentRefreshFailure(ctx context.Context, credential accountdomain.Credential, now time.Time, force bool) (accountdomain.Credential, error, bool) {
+	if !credential.RefreshPermanent {
+		return accountdomain.Credential{}, nil, false
+	}
+	accessTokenAlive := credential.EncryptedAccessToken != "" && !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(now)
+	if accessTokenAlive && !force {
+		return credential, nil, true
+	}
+	if !accessTokenAlive {
+		if err := s.MarkReauthRequired(ctx, credential.ID, permanentRefreshExpiredReason); err != nil {
+			return accountdomain.Credential{}, err, true
+		}
+	}
+	if credential.LastRefreshErrorCode == "" {
+		return accountdomain.Credential{}, ErrCredentialRefreshPermanent, true
+	}
+	return accountdomain.Credential{}, fmt.Errorf("%w: %s", ErrCredentialRefreshPermanent, credential.LastRefreshErrorCode), true
 }
 
 func credentialRefreshBackoff(accountID uint64, failureCount int, retryAfter time.Duration) time.Duration {
@@ -1597,15 +1860,9 @@ func (s *Service) refreshQuotaMode(ctx context.Context, id uint64, mode string) 
 	var tier accountdomain.WebTier
 	quotaKind, _ := s.providers.QuotaKind(value.Provider)
 	if quotaKind == provider.QuotaRemoteWindow {
+		// 单模式核实只负责更新本次 429 对应的窗口。套餐判级由完整额度同步负责；
+		// 这里再次调用 SyncQuota 会重复请求当前模式，并额外访问其他额度端点。
 		tier = value.WebTier
-		if tier == "" || tier == accountdomain.WebTierAuto {
-			if snapshot, syncErr := adapter.SyncQuota(ctx, value); syncErr == nil {
-				tier = snapshot.Tier
-				_ = s.accounts.ReplaceQuotaWindows(ctx, id, snapshot.Tier, snapshot.SyncedAt, snapshot.Windows)
-			} else {
-				tier = accountdomain.WebTierBasic
-			}
-		}
 	}
 	now := time.Now().UTC()
 	if err := s.accounts.SaveQuotaWindows(ctx, id, tier, now, []accountdomain.QuotaWindow{window}); err != nil {
@@ -1686,6 +1943,17 @@ func (s *Service) RunWebQuotaRefresh(ctx context.Context) {
 
 func (s *Service) runWebQuotaRefresh(parent context.Context, request webQuotaRefreshRequest) {
 	for {
+		// Worker 开始前已经合并的重复请求由本轮远端快照覆盖。只有网络请求
+		// 进行期间再次到达的调用才需要尾随刷新，避免每个突发批次固定请求两次。
+		s.quotaRefreshMu.Lock()
+		state := s.quotaRefreshes[request.key]
+		if state == nil {
+			s.quotaRefreshMu.Unlock()
+			return
+		}
+		state.pending = false
+		s.quotaRefreshMu.Unlock()
+
 		ctx, cancel := context.WithTimeout(parent, webQuotaRefreshTimeout)
 		refreshMode := request.mode
 		if windows, err := s.accounts.GetQuotaWindows(ctx, []uint64{request.accountID}); err == nil {
@@ -1698,11 +1966,21 @@ func (s *Service) runWebQuotaRefresh(parent context.Context, request webQuotaRef
 		}
 		if refreshMode != "" {
 			var refreshErr error
-			if err := s.syncPool.Do(ctx, func(workCtx context.Context) error {
-				_, refreshErr = s.RefreshWebQuotaMode(workCtx, request.accountID, refreshMode)
-				return refreshErr
-			}); err != nil {
-				refreshErr = err
+			acquired := true
+			var release func()
+			if s.refreshLock != nil {
+				release, acquired, refreshErr = s.refreshLock.Acquire(ctx, "quota-refresh:"+request.key, webQuotaRefreshTimeout)
+			}
+			if refreshErr == nil && acquired {
+				if err := s.syncPool.Do(ctx, func(workCtx context.Context) error {
+					_, refreshErr = s.RefreshWebQuotaMode(workCtx, request.accountID, refreshMode)
+					return refreshErr
+				}); err != nil {
+					refreshErr = err
+				}
+			}
+			if release != nil {
+				release()
 			}
 			if refreshErr != nil && !errors.Is(refreshErr, context.Canceled) {
 				s.logger.Warn("web_quota_refresh_failed", "account_id", request.accountID, "mode", refreshMode, "error", refreshErr)
@@ -1711,7 +1989,7 @@ func (s *Service) runWebQuotaRefresh(parent context.Context, request webQuotaRef
 		cancel()
 
 		s.quotaRefreshMu.Lock()
-		state := s.quotaRefreshes[request.key]
+		state = s.quotaRefreshes[request.key]
 		if state != nil && state.pending {
 			state.pending = false
 			s.quotaRefreshMu.Unlock()
@@ -1867,6 +2145,18 @@ func (s *Service) BatchRefreshBilling(ctx context.Context, ids []uint64) (int, i
 	return s.refreshBillings(ctx, values, nil)
 }
 
+// BatchRefreshQuota 使用有限并发同步选中 Web 或 Console 账号的额度窗口。
+func (s *Service) BatchRefreshQuota(ctx context.Context, ids []uint64) (int, int, error) {
+	values, err := normalizeBatchIDs(ids)
+	if err != nil {
+		return 0, 0, err
+	}
+	return s.runAccountBatch(ctx, "quota_sync", values, s.syncPool, nil, func(workCtx context.Context, id uint64) error {
+		_, err := s.RefreshQuota(workCtx, id)
+		return err
+	})
+}
+
 func (s *Service) refreshBillings(ctx context.Context, ids []uint64, progress BatchProgressObserver) (int, int, error) {
 	return s.runAccountBatch(ctx, "billing_sync", ids, s.syncPool, progress, func(workCtx context.Context, id uint64) error {
 		_, err := s.RefreshBilling(workCtx, id)
@@ -1910,7 +2200,7 @@ func (s *Service) runAccountBatch(ctx context.Context, operation string, ids []u
 
 func (s *Service) logBatchSummary(operation string, pool *batch.Pool, summary batch.Summary, err error) {
 	snapshot := pool.Snapshot()
-	s.logger.Info("account_bulk_completed", "operation", operation, "total", summary.Total, "submitted", summary.Submitted, "succeeded", summary.Succeeded, "failed", summary.Failed, "panicked", summary.Panicked, "duration_ms", summary.Duration.Milliseconds(), "canceled", summary.Canceled, "pool_limit", snapshot.Limit, "pool_active", snapshot.Active, "pool_peak", snapshot.Peak, "error", err)
+	s.logger.Info("account_bulk_completed", "operation", operation, "total", summary.Total, "submitted", summary.Submitted, "succeeded", summary.Succeeded, "failed", summary.Failed, "panicked", summary.Panicked, "duration_ms", summary.Duration.Milliseconds(), "canceled", summary.Canceled, "pool_limit", snapshot.Limit, "pool_active", snapshot.Active, "pool_queued", snapshot.Queued, "pool_peak", snapshot.Peak, "error", err)
 }
 
 func (s *Service) persistSeed(ctx context.Context, seed provider.CredentialSeed) (accountdomain.Credential, bool, error) {
@@ -1934,6 +2224,17 @@ func (s *Service) credentialFromSeed(seed provider.CredentialSeed) (accountdomai
 	if err != nil {
 		return accountdomain.Credential{}, err
 	}
+	cloudflareEncrypted := ""
+	if strings.TrimSpace(seed.CloudflareCookies) != "" {
+		cookies := egressapp.SanitizeCloudflareCookies(seed.CloudflareCookies)
+		if cookies == "" {
+			return accountdomain.Credential{}, invalidInput("Cloudflare Cookie 中没有有效字段")
+		}
+		cloudflareEncrypted, err = s.cipher.Encrypt(cookies)
+		if err != nil {
+			return accountdomain.Credential{}, err
+		}
+	}
 	sourceKey := seed.SourceKey
 	if sourceKey == "" {
 		sourceKey = "device:" + security.HashToken(seed.AccessToken)
@@ -1953,7 +2254,7 @@ func (s *Service) credentialFromSeed(seed provider.CredentialSeed) (accountdomai
 		}
 		authType = definition.Credential.AuthType
 	}
-	value := accountdomain.Credential{Provider: providerValue, AuthType: authType, WebTier: seed.WebTier, Name: seed.Name, Email: seed.Email, UserID: seed.UserID, TeamID: seed.TeamID, SourceKey: sourceKey, OIDCClientID: seed.OIDCClientID, EncryptedAccessToken: accessEncrypted, EncryptedRefreshToken: refreshEncrypted, ExpiresAt: seed.ExpiresAt, Enabled: true, AuthStatus: accountdomain.AuthStatusActive, Priority: accountdomain.DefaultPriority, MaxConcurrent: accountdomain.DefaultMaxConcurrent, MinimumRemaining: accountdomain.DefaultMinimumRemaining}
+	value := accountdomain.Credential{Provider: providerValue, AuthType: authType, WebTier: seed.WebTier, Name: seed.Name, Email: seed.Email, UserID: seed.UserID, TeamID: seed.TeamID, SourceKey: sourceKey, OIDCClientID: seed.OIDCClientID, EncryptedAccessToken: accessEncrypted, EncryptedRefreshToken: refreshEncrypted, EncryptedCloudflareCookie: cloudflareEncrypted, ExpiresAt: seed.ExpiresAt, Enabled: true, AuthStatus: accountdomain.AuthStatusActive, Priority: accountdomain.DefaultPriority, MaxConcurrent: accountdomain.DefaultMaxConcurrent, MinimumRemaining: accountdomain.DefaultMinimumRemaining}
 	return value, nil
 }
 

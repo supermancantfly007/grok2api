@@ -11,22 +11,26 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/chenyme/grok2api/backend/internal/transport/http/middleware"
 )
 
+func testDependencies() Dependencies {
+	return Dependencies{RequestTimeout: time.Second, MaxBodyBytes: 1024, ConcurrencyGate: middleware.NewConcurrencyGate(1024)}
+}
+
 func TestReadinessEndpointReturnsStructuredDegradedStateAsReady(t *testing.T) {
-	router := New(Dependencies{
-		RequestTimeout: time.Second,
-		MaxBodyBytes:   1024,
-		Readiness: func(context.Context) ReadinessSnapshot {
-			return ReadinessSnapshot{
-				Ready: true, State: "degraded", UpdatedAt: time.Now().UTC(),
-				Components: map[string]ReadinessComponent{
-					"grok_build": {State: "ready"},
-					"grok_web":   {State: "unavailable"},
-				},
-			}
-		},
-	})
+	deps := testDependencies()
+	deps.Readiness = func(context.Context) ReadinessSnapshot {
+		return ReadinessSnapshot{
+			Ready: true, State: "degraded", UpdatedAt: time.Now().UTC(),
+			Components: map[string]ReadinessComponent{
+				"grok_build": {State: "ready"},
+				"grok_web":   {State: "unavailable"},
+			},
+		}
+	}
+	router := New(deps)
 	request := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, request)
@@ -43,9 +47,11 @@ func TestReadinessEndpointReturnsStructuredDegradedStateAsReady(t *testing.T) {
 }
 
 func TestReadinessEndpointReturns503WhileReconciling(t *testing.T) {
-	router := New(Dependencies{RequestTimeout: time.Second, MaxBodyBytes: 1024, Readiness: func(context.Context) ReadinessSnapshot {
+	deps := testDependencies()
+	deps.Readiness = func(context.Context) ReadinessSnapshot {
 		return ReadinessSnapshot{Ready: false, State: "reconciling", UpdatedAt: time.Now().UTC()}
-	}})
+	}
+	router := New(deps)
 	request := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, request)
@@ -55,7 +61,9 @@ func TestReadinessEndpointReturns503WhileReconciling(t *testing.T) {
 }
 
 func TestInferenceTrafficIsRejectedWhileReconciling(t *testing.T) {
-	router := New(Dependencies{RequestTimeout: time.Second, MaxBodyBytes: 1024, TrafficReady: func() bool { return false }})
+	deps := testDependencies()
+	deps.TrafficReady = func() bool { return false }
+	router := New(deps)
 	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, request)
@@ -64,13 +72,24 @@ func TestInferenceTrafficIsRejectedWhileReconciling(t *testing.T) {
 	}
 }
 
-func TestSystemInfoRequiresAdminAuthentication(t *testing.T) {
-	router := New(Dependencies{RequestTimeout: time.Second, MaxBodyBytes: 1024, PublicAPIBaseURL: "https://api.example.com"})
-	request := httptest.NewRequest(http.MethodGet, "/api/admin/v1/system", nil)
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+func TestSystemEndpointsRequireAdminAuthentication(t *testing.T) {
+	deps := testDependencies()
+	deps.PublicAPIBaseURL = "https://api.example.com"
+	router := New(deps)
+	for _, route := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodGet, path: "/api/admin/v1/system"},
+		{method: http.MethodGet, path: "/api/admin/v1/system/version"},
+		{method: http.MethodPost, path: "/api/admin/v1/system/update/check"},
+	} {
+		request := httptest.NewRequest(route.method, route.path, nil)
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("%s %s status = %d, want %d", route.method, route.path, recorder.Code, http.StatusUnauthorized)
+		}
 	}
 }
 
@@ -85,7 +104,10 @@ func TestFrontendStaticFilesAndSPAFallback(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "assets", "app.js"), []byte("console.log('app')"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	router := New(Dependencies{Logger: slog.Default(), RequestTimeout: time.Second, MaxBodyBytes: 1024, FrontendStaticPath: root})
+	deps := testDependencies()
+	deps.Logger = slog.Default()
+	deps.FrontendStaticPath = root
+	router := New(deps)
 
 	for _, test := range []struct {
 		path        string
@@ -117,7 +139,9 @@ func TestFrontendStaticFilesAndSPAFallback(t *testing.T) {
 }
 
 func TestSwaggerRegistrationFollowsStartupConfig(t *testing.T) {
-	disabled := New(Dependencies{Logger: slog.Default(), RequestTimeout: time.Second, MaxBodyBytes: 1024})
+	disabledDeps := testDependencies()
+	disabledDeps.Logger = slog.Default()
+	disabled := New(disabledDeps)
 	disabledRequest := httptest.NewRequest(http.MethodGet, "/swagger/doc.json", nil)
 	disabledRecorder := httptest.NewRecorder()
 	disabled.ServeHTTP(disabledRecorder, disabledRequest)
@@ -125,7 +149,10 @@ func TestSwaggerRegistrationFollowsStartupConfig(t *testing.T) {
 		t.Fatalf("disabled swagger status = %d, want %d", disabledRecorder.Code, http.StatusNotFound)
 	}
 
-	enabled := New(Dependencies{Logger: slog.Default(), RequestTimeout: time.Second, MaxBodyBytes: 1024, SwaggerEnabled: true})
+	enabledDeps := testDependencies()
+	enabledDeps.Logger = slog.Default()
+	enabledDeps.SwaggerEnabled = true
+	enabled := New(enabledDeps)
 	enabledRequest := httptest.NewRequest(http.MethodGet, "/swagger/doc.json", nil)
 	enabledRecorder := httptest.NewRecorder()
 	enabled.ServeHTTP(enabledRecorder, enabledRequest)

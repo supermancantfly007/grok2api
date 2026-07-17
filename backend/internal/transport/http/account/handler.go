@@ -143,6 +143,7 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/accounts/refresh-tokens", h.refreshAllTokens)
 	router.POST("/accounts/probe-health", h.probeBuildHealth)
 	router.POST("/accounts/batch/refresh-billing", h.batchRefreshBilling)
+	router.POST("/accounts/batch/refresh-quotas", h.batchRefreshQuotas)
 	router.PATCH("/accounts/batch", h.batchUpdate)
 	router.DELETE("/accounts", h.batchDelete)
 	router.PATCH("/accounts/:id", h.update)
@@ -153,11 +154,13 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 }
 
 type updateRequest struct {
-	Name             *string  `json:"name"`
-	Enabled          *bool    `json:"enabled"`
-	Priority         *int     `json:"priority"`
-	MaxConcurrent    *int     `json:"maxConcurrent"`
-	MinimumRemaining *float64 `json:"minimumRemaining"`
+	Name                   *string  `json:"name"`
+	Enabled                *bool    `json:"enabled"`
+	Priority               *int     `json:"priority"`
+	MaxConcurrent          *int     `json:"maxConcurrent"`
+	MinimumRemaining       *float64 `json:"minimumRemaining"`
+	CloudflareCookies      *string  `json:"cloudflareCookies"`
+	ClearCloudflareCookies bool     `json:"clearCloudflareCookies"`
 }
 
 type batchUpdateRequest struct {
@@ -174,9 +177,16 @@ type batchDeleteRequest struct {
 	Provider string   `json:"provider" binding:"required"`
 }
 
-type accountSelectionRequest struct {
-	IDs []string `json:"ids"`
-	All bool     `json:"all"`
+type buildConversionRequest struct {
+	IDs      []string                           `json:"ids"`
+	All      bool                               `json:"all"`
+	Strategy accountapp.BuildConversionStrategy `json:"strategy"`
+}
+
+type webConsoleSyncRequest struct {
+	IDs      []string                          `json:"ids"`
+	All      bool                              `json:"all"`
+	Strategy accountapp.WebConsoleSyncStrategy `json:"strategy"`
 }
 
 type buildConversionResponse struct {
@@ -208,44 +218,46 @@ type accountTokenRefreshResponse struct {
 type accountImportResponse struct {
 	Created    int `json:"created"`
 	Updated    int `json:"updated"`
+	Skipped    int `json:"skipped"`
 	Synced     int `json:"synced"`
 	SyncFailed int `json:"syncFailed"`
 }
 
 type accountResponse struct {
-	ID               uint64                `json:"id,string"`
-	Provider         string                `json:"provider"`
-	AuthType         string                `json:"authType"`
-	WebTier          string                `json:"webTier,omitempty"`
-	WebTierSyncedAt  *time.Time            `json:"webTierSyncedAt,omitempty"`
-	Name             string                `json:"name"`
-	Email            string                `json:"email,omitempty"`
-	UserID           string                `json:"userId,omitempty"`
-	TeamID           string                `json:"teamId,omitempty"`
-	Enabled          bool                  `json:"enabled"`
-	AuthStatus       string                `json:"authStatus"`
-	ExpiresAt        *time.Time            `json:"expiresAt,omitempty"`
-	Refreshable      bool                  `json:"refreshable"`
-	RefreshDueAt     *time.Time            `json:"refreshDueAt,omitempty"`
-	LastRefreshAt    *time.Time            `json:"lastRefreshAt,omitempty"`
-	RefreshFailures  int                   `json:"refreshFailureCount"`
-	LastRefreshError string                `json:"lastRefreshErrorCode,omitempty"`
-	Priority         int                   `json:"priority"`
-	MaxConcurrent    int                   `json:"maxConcurrent"`
-	MinimumRemaining float64               `json:"minimumRemaining"`
-	FailureCount     int                   `json:"failureCount"`
-	CooldownUntil    *time.Time            `json:"cooldownUntil,omitempty"`
-	LastError        string                `json:"lastError,omitempty"`
-	LastUsedAt       *time.Time            `json:"lastUsedAt,omitempty"`
-	LinkedAccountID  uint64                `json:"linkedAccountId,omitempty,string"`
-	LinkedName       string                `json:"linkedAccountName,omitempty"`
-	LinkedProvider   string                `json:"linkedProvider,omitempty"`
-	CreatedAt        time.Time             `json:"createdAt"`
-	ObservedModel    string                `json:"observedModel,omitempty"`
-	ObservedModelAt  *time.Time            `json:"observedModelAt,omitempty"`
-	Billing          *billingResponse      `json:"billing,omitempty"`
-	Quota            quotaResponse         `json:"quota"`
-	QuotaWindows     []quotaWindowResponse `json:"quotaWindows,omitempty"`
+	ID                         uint64                `json:"id,string"`
+	Provider                   string                `json:"provider"`
+	AuthType                   string                `json:"authType"`
+	WebTier                    string                `json:"webTier,omitempty"`
+	WebTierSyncedAt            *time.Time            `json:"webTierSyncedAt,omitempty"`
+	Name                       string                `json:"name"`
+	Email                      string                `json:"email,omitempty"`
+	UserID                     string                `json:"userId,omitempty"`
+	TeamID                     string                `json:"teamId,omitempty"`
+	Enabled                    bool                  `json:"enabled"`
+	AuthStatus                 string                `json:"authStatus"`
+	ExpiresAt                  *time.Time            `json:"expiresAt,omitempty"`
+	Refreshable                bool                  `json:"refreshable"`
+	RefreshDueAt               *time.Time            `json:"refreshDueAt,omitempty"`
+	LastRefreshAt              *time.Time            `json:"lastRefreshAt,omitempty"`
+	RefreshFailures            int                   `json:"refreshFailureCount"`
+	LastRefreshError           string                `json:"lastRefreshErrorCode,omitempty"`
+	Priority                   int                   `json:"priority"`
+	MaxConcurrent              int                   `json:"maxConcurrent"`
+	MinimumRemaining           float64               `json:"minimumRemaining"`
+	FailureCount               int                   `json:"failureCount"`
+	CooldownUntil              *time.Time            `json:"cooldownUntil,omitempty"`
+	LastError                  string                `json:"lastError,omitempty"`
+	LastUsedAt                 *time.Time            `json:"lastUsedAt,omitempty"`
+	LinkedAccountID            uint64                `json:"linkedAccountId,omitempty,string"`
+	LinkedName                 string                `json:"linkedAccountName,omitempty"`
+	LinkedProvider             string                `json:"linkedProvider,omitempty"`
+	CreatedAt                  time.Time             `json:"createdAt"`
+	ObservedModel              string                `json:"observedModel,omitempty"`
+	ObservedModelAt            *time.Time            `json:"observedModelAt,omitempty"`
+	CloudflareCookieConfigured bool                  `json:"cloudflareCookieConfigured"`
+	Billing                    *billingResponse      `json:"billing,omitempty"`
+	Quota                      quotaResponse         `json:"quota"`
+	QuotaWindows               []quotaWindowResponse `json:"quotaWindows,omitempty"`
 }
 
 type quotaWindowResponse struct {
@@ -276,6 +288,7 @@ type billingResponse struct {
 	PrepaidBalance       float64                  `json:"prepaidBalance"`
 	CreditUsagePercent   float64                  `json:"creditUsagePercent"`
 	IsUnifiedBillingUser bool                     `json:"isUnifiedBillingUser"`
+	OnDemandEnabled      *bool                    `json:"onDemandEnabled,omitempty"`
 	TopUpMethod          string                   `json:"topUpMethod,omitempty"`
 	UsagePeriodType      string                   `json:"usagePeriodType,omitempty"`
 	UsagePeriodStart     string                   `json:"usagePeriodStart,omitempty"`
@@ -289,6 +302,9 @@ type billingResponse struct {
 type billingHistoryResponse struct {
 	Year         int     `json:"year"`
 	Month        int     `json:"month"`
+	PeriodType   string  `json:"periodType,omitempty"`
+	PeriodStart  string  `json:"periodStart,omitempty"`
+	PeriodEnd    string  `json:"periodEnd,omitempty"`
 	IncludedUsed float64 `json:"includedUsed"`
 	OnDemandUsed float64 `json:"onDemandUsed"`
 	TotalUsed    float64 `json:"totalUsed"`
@@ -409,15 +425,48 @@ func (h *Handler) batchRefreshBilling(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
 		return
 	}
-	if request.Provider != string(accountdomain.ProviderBuild) || !h.validateProviderIDs(c, ids, request.Provider) {
-		if request.Provider != string(accountdomain.ProviderBuild) {
-			response.Error(c, http.StatusBadRequest, "invalidProvider", "Grok Web 账号不支持 Billing 批量同步")
-		}
+	if request.Provider != string(accountdomain.ProviderBuild) {
+		response.Error(c, http.StatusBadRequest, "invalidProvider", "仅 Grok Build 账号支持 Billing 同步")
+		return
+	}
+	if !h.validateProviderIDs(c, ids, request.Provider) {
 		return
 	}
 	succeeded, failed, err := h.service.BatchRefreshBilling(c.Request.Context(), ids)
 	if err != nil {
-		h.writeServiceError(c, "billingBatchRefreshFailed", err, http.StatusBadGateway, "批量同步账号额度失败")
+		h.writeServiceError(c, "billingBatchRefreshFailed", err, http.StatusBadGateway, "批量同步 Billing 失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"succeeded": succeeded, "failed": failed})
+}
+
+func (h *Handler) batchRefreshQuotas(c *gin.Context) {
+	var request batchDeleteRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	ids, err := parseIDs(request.IDs)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
+		return
+	}
+	providerValue := accountdomain.Provider(request.Provider)
+	if !providerValue.IsValid() {
+		response.Error(c, http.StatusBadRequest, "invalidProvider", "账号来源无效")
+		return
+	}
+	if !h.validateProviderIDs(c, ids, request.Provider) {
+		return
+	}
+	var succeeded, failed int
+	if providerValue == accountdomain.ProviderBuild {
+		succeeded, failed, err = h.service.BatchRefreshBilling(c.Request.Context(), ids)
+	} else {
+		succeeded, failed, err = h.service.BatchRefreshQuota(c.Request.Context(), ids)
+	}
+	if err != nil {
+		h.writeServiceError(c, "quotaBatchRefreshFailed", err, http.StatusBadGateway, "批量同步账号额度失败")
 		return
 	}
 	response.Success(c, http.StatusOK, gin.H{"succeeded": succeeded, "failed": failed})
@@ -487,7 +536,7 @@ func (h *Handler) importConsoleAuth(c *gin.Context) {
 }
 
 func (h *Handler) convertWebToBuild(c *gin.Context) {
-	var request accountSelectionRequest
+	var request buildConversionRequest
 	if c.ShouldBindJSON(&request) != nil {
 		response.Error(c, http.StatusBadRequest, "invalidRequest", "转换请求无效")
 		return
@@ -496,6 +545,13 @@ func (h *Handler) convertWebToBuild(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidRequest", "全部转换与指定账号不能同时提交")
 		return
 	}
+	if request.Strategy == "" {
+		request.Strategy = accountapp.BuildConversionMissing
+	}
+	if request.Strategy != accountapp.BuildConversionAll && request.Strategy != accountapp.BuildConversionMissing {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "转换策略无效")
+		return
+	}
 	var ids []uint64
 	if !request.All {
 		var err error
@@ -504,12 +560,15 @@ func (h *Handler) convertWebToBuild(c *gin.Context) {
 			response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
 			return
 		}
+		if !h.validateProviderIDs(c, ids, string(accountdomain.ProviderWeb)) {
+			return
+		}
 	}
-	h.streamWebToBuildConversion(c, request.All, ids)
+	h.streamWebToBuildConversion(c, request.All, ids, request.Strategy)
 }
 
 func (h *Handler) syncWebToConsole(c *gin.Context) {
-	var request accountSelectionRequest
+	var request webConsoleSyncRequest
 	if c.ShouldBindJSON(&request) != nil {
 		response.Error(c, http.StatusBadRequest, "invalidRequest", "同步请求无效")
 		return
@@ -518,6 +577,13 @@ func (h *Handler) syncWebToConsole(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidRequest", "全部同步与指定账号不能同时提交")
 		return
 	}
+	if request.Strategy == "" {
+		request.Strategy = accountapp.WebConsoleSyncAll
+	}
+	if request.Strategy != accountapp.WebConsoleSyncAll && request.Strategy != accountapp.WebConsoleSyncMissing {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "同步策略无效")
+		return
+	}
 	var ids []uint64
 	if !request.All {
 		var err error
@@ -526,57 +592,60 @@ func (h *Handler) syncWebToConsole(c *gin.Context) {
 			response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
 			return
 		}
+		if !h.validateProviderIDs(c, ids, string(accountdomain.ProviderWeb)) {
+			return
+		}
 	}
-	h.streamWebToConsoleSync(c, request.All, ids)
+	h.streamWebToConsoleSync(c, request.All, ids, request.Strategy)
 }
 
-func (h *Handler) runWebToConsoleSync(ctx context.Context, all bool, ids []uint64, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int)) (accountapp.ImportResult, accountsyncapp.Result, error) {
+func (h *Handler) runWebToConsoleSync(ctx context.Context, all bool, ids []uint64, strategy accountapp.WebConsoleSyncStrategy, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int)) (accountapp.ImportResult, accountsyncapp.Result, error) {
 	pipeline := h.startSyncPipeline(ctx, syncProgress)
 	var (
 		result accountapp.ImportResult
 		err    error
 	)
 	if all {
-		result, err = h.service.SyncAllWebAccountsToConsoleWithProgress(pipeline.ctx, pipeline.Observe, progress)
+		result, err = h.service.SyncAllWebAccountsToConsoleWithStrategy(pipeline.ctx, strategy, pipeline.Observe, progress)
 	} else {
-		result, err = h.service.SyncWebAccountsToConsoleWithProgress(pipeline.ctx, ids, pipeline.Observe, progress)
+		result, err = h.service.SyncWebAccountsToConsoleWithStrategy(pipeline.ctx, ids, strategy, pipeline.Observe, progress)
 	}
 	syncResult := pipeline.Finish(err != nil)
 	return result, syncResult, err
 }
 
-func (h *Handler) streamWebToConsoleSync(c *gin.Context, all bool, ids []uint64) {
+func (h *Handler) streamWebToConsoleSync(c *gin.Context, all bool, ids []uint64, strategy accountapp.WebConsoleSyncStrategy) {
 	stream := newAccountEventStream(c)
 	defer stream.Close()
 	var total atomic.Int64
-	result, syncResult, err := h.runWebToConsoleSync(c.Request.Context(), all, ids, stream.PhaseProgressObserver("importing", &total), stream.SyncProgressObserver())
+	result, syncResult, err := h.runWebToConsoleSync(c.Request.Context(), all, ids, strategy, stream.PhaseProgressObserver("importing", &total), stream.SyncProgressObserver())
 	if err != nil {
 		stream.WriteError("accountConsoleSyncFailed", "Grok Web 账号同步到 Console 失败")
 		return
 	}
-	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
+	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
 }
 
-func (h *Handler) runWebToBuildConversion(ctx context.Context, all bool, ids []uint64, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int)) (accountapp.BuildConversionResult, accountsyncapp.Result, error) {
+func (h *Handler) runWebToBuildConversion(ctx context.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int)) (accountapp.BuildConversionResult, accountsyncapp.Result, error) {
 	pipeline := h.startSyncPipeline(ctx, syncProgress)
 	var (
 		result accountapp.BuildConversionResult
 		err    error
 	)
 	if all {
-		result, err = h.service.ConvertAllWebAccountsToBuildWithProgress(pipeline.ctx, pipeline.Observe, progress)
+		result, err = h.service.ConvertAllWebAccountsToBuildWithStrategy(pipeline.ctx, strategy, pipeline.Observe, progress)
 	} else {
-		result, err = h.service.ConvertWebAccountsToBuildWithProgress(pipeline.ctx, ids, pipeline.Observe, progress)
+		result, err = h.service.ConvertWebAccountsToBuildWithStrategy(pipeline.ctx, ids, strategy, pipeline.Observe, progress)
 	}
 	syncResult := pipeline.Finish(err != nil)
 	return result, syncResult, err
 }
 
-func (h *Handler) streamWebToBuildConversion(c *gin.Context, all bool, ids []uint64) {
+func (h *Handler) streamWebToBuildConversion(c *gin.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy) {
 	stream := newAccountEventStream(c)
 	defer stream.Close()
 	var total atomic.Int64
-	result, syncResult, err := h.runWebToBuildConversion(c.Request.Context(), all, ids, stream.PhaseProgressObserver("converting", &total), stream.SyncProgressObserver())
+	result, syncResult, err := h.runWebToBuildConversion(c.Request.Context(), all, ids, strategy, stream.PhaseProgressObserver("converting", &total), stream.SyncProgressObserver())
 	if err != nil {
 		stream.WriteError("accountConversionFailed", "Grok Web 账号转换失败")
 		return
@@ -832,7 +901,7 @@ func (h *Handler) update(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
 		return
 	}
-	value, err := h.service.Update(c.Request.Context(), id, accountapp.UpdateInput{Name: request.Name, Enabled: request.Enabled, Priority: request.Priority, MaxConcurrent: request.MaxConcurrent, MinimumRemaining: request.MinimumRemaining})
+	value, err := h.service.Update(c.Request.Context(), id, accountapp.UpdateInput{Name: request.Name, Enabled: request.Enabled, Priority: request.Priority, MaxConcurrent: request.MaxConcurrent, MinimumRemaining: request.MinimumRemaining, CloudflareCookies: request.CloudflareCookies, ClearCloudflareCookies: request.ClearCloudflareCookies})
 	if err != nil {
 		h.writeServiceError(c, "accountUpdateFailed", err, http.StatusInternalServerError, "更新账号失败")
 		return
@@ -1016,7 +1085,8 @@ func newAccountResponse(value accountapp.View) accountResponse {
 		FailureCount: c.FailureCount, CooldownUntil: c.CooldownUntil, LastError: c.LastError,
 		LastUsedAt: c.LastUsedAt, LinkedAccountID: c.LinkedAccountID, LinkedName: c.LinkedAccountName, LinkedProvider: string(c.LinkedProvider),
 		CreatedAt: c.CreatedAt, ObservedModel: c.ObservedModel, ObservedModelAt: c.ObservedModelAt,
-		Quota: newQuotaResponse(value.Quota), QuotaWindows: make([]quotaWindowResponse, 0, len(value.QuotaWindows)),
+		CloudflareCookieConfigured: c.EncryptedCloudflareCookie != "",
+		Quota:                      newQuotaResponse(value.Quota), QuotaWindows: make([]quotaWindowResponse, 0, len(value.QuotaWindows)),
 	}
 	for _, window := range value.QuotaWindows {
 		breakdown := make([]quotaBreakdownResponse, 0, len(window.Breakdown))
@@ -1048,9 +1118,13 @@ func newQuotaResponse(value accountapp.QuotaView) quotaResponse {
 func newBillingResponse(value accountdomain.Billing) billingResponse {
 	history := make([]billingHistoryResponse, 0, len(value.History))
 	for _, entry := range value.History {
-		history = append(history, billingHistoryResponse{Year: entry.Year, Month: entry.Month, IncludedUsed: entry.IncludedUsed, OnDemandUsed: entry.OnDemandUsed, TotalUsed: entry.TotalUsed})
+		history = append(history, billingHistoryResponse{
+			Year: entry.Year, Month: entry.Month,
+			PeriodType: entry.PeriodType, PeriodStart: entry.PeriodStart, PeriodEnd: entry.PeriodEnd,
+			IncludedUsed: entry.IncludedUsed, OnDemandUsed: entry.OnDemandUsed, TotalUsed: entry.TotalUsed,
+		})
 	}
-	return billingResponse{PlanCode: value.PlanCode, PlanName: value.PlanName, MonthlyLimit: value.MonthlyLimit, Used: value.Used, Remaining: value.Remaining(), OnDemandCap: value.OnDemandCap, OnDemandUsed: value.OnDemandUsed, PrepaidBalance: value.PrepaidBalance, CreditUsagePercent: value.CreditUsagePercent, IsUnifiedBillingUser: value.IsUnifiedBillingUser, TopUpMethod: value.TopUpMethod, UsagePeriodType: value.UsagePeriodType, UsagePeriodStart: value.UsagePeriodStart, UsagePeriodEnd: value.UsagePeriodEnd, BillingPeriodStart: value.BillingPeriodStart, BillingPeriodEnd: value.BillingPeriodEnd, History: history, SyncedAt: value.SyncedAt}
+	return billingResponse{PlanCode: value.PlanCode, PlanName: value.PlanName, MonthlyLimit: value.MonthlyLimit, Used: value.Used, Remaining: value.Remaining(), OnDemandCap: value.OnDemandCap, OnDemandUsed: value.OnDemandUsed, PrepaidBalance: value.PrepaidBalance, CreditUsagePercent: value.CreditUsagePercent, IsUnifiedBillingUser: value.IsUnifiedBillingUser, OnDemandEnabled: value.OnDemandEnabled, TopUpMethod: value.TopUpMethod, UsagePeriodType: value.UsagePeriodType, UsagePeriodStart: value.UsagePeriodStart, UsagePeriodEnd: value.UsagePeriodEnd, BillingPeriodStart: value.BillingPeriodStart, BillingPeriodEnd: value.BillingPeriodEnd, History: history, SyncedAt: value.SyncedAt}
 }
 
 func pagination(c *gin.Context) (int, int) {

@@ -15,13 +15,24 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
 
+type videoUpstreamError struct {
+	status int
+	body   string
+}
+
+func (e *videoUpstreamError) Error() string {
+	return fmt.Sprintf("视频上游返回 %d: %s", e.status, e.body)
+}
+
+func (e *videoUpstreamError) HTTPStatusCode() int { return e.status }
+
 func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
 	cfg := a.config()
 	token, err := a.cipher.Decrypt(request.Credential.EncryptedAccessToken)
 	if err != nil {
 		return provider.VideoResult{}, err
 	}
-	lease, err := a.egress.Acquire(ctx, domainegress.ScopeWeb, fmt.Sprintf("%d", request.Credential.ID))
+	lease, err := a.egress.AcquireCredential(ctx, domainegress.ScopeWeb, request.Credential)
 	if err != nil {
 		return provider.VideoResult{}, err
 	}
@@ -93,7 +104,7 @@ func parseVideoStream(response *http.Response, progress func(int)) (provider.Vid
 		if response.StatusCode == http.StatusUnauthorized {
 			return provider.VideoResult{}, "", provider.ErrUnauthorized
 		}
-		return provider.VideoResult{}, "", fmt.Errorf("视频上游返回 %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
+		return provider.VideoResult{}, "", &videoUpstreamError{status: response.StatusCode, body: strings.TrimSpace(string(body))}
 	}
 	var result provider.VideoResult
 	var postID string

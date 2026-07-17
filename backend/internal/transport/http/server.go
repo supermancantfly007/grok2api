@@ -18,6 +18,7 @@ import (
 	mediaapp "github.com/chenyme/grok2api/backend/internal/application/media"
 	modelapp "github.com/chenyme/grok2api/backend/internal/application/model"
 	settingsapp "github.com/chenyme/grok2api/backend/internal/application/settings"
+	updatecheckapp "github.com/chenyme/grok2api/backend/internal/application/updatecheck"
 	accounthttp "github.com/chenyme/grok2api/backend/internal/transport/http/account"
 	adminauthhttp "github.com/chenyme/grok2api/backend/internal/transport/http/adminauth"
 	audithttp "github.com/chenyme/grok2api/backend/internal/transport/http/audit"
@@ -39,6 +40,7 @@ type Dependencies struct {
 	Logger             *slog.Logger
 	RequestTimeout     time.Duration
 	MaxBodyBytes       int64
+	ConcurrencyGate    *middleware.ConcurrencyGate
 	SecureCookies      bool
 	SwaggerEnabled     bool
 	PublicAPIBaseURL   string
@@ -58,6 +60,7 @@ type Dependencies struct {
 	Media        *mediaapp.Service
 	Settings     *settingsapp.Service
 	Egress       *egressapp.Service
+	Updates      *updatecheckapp.Service
 }
 
 type ReadinessComponent struct {
@@ -100,6 +103,9 @@ type ReadinessSnapshot struct {
 
 // New 创建完整 HTTP 路由并明确区分公共、管理员和客户端鉴权边界。
 func New(deps Dependencies) *gin.Engine {
+	if deps.ConcurrencyGate == nil {
+		panic("httpserver: ConcurrencyGate 不能为空")
+	}
 	gin.SetMode(gin.ReleaseMode)
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
@@ -148,9 +154,10 @@ func New(deps Dependencies) *gin.Engine {
 			return deps.Settings.PublicAPIBaseURL()
 		}
 		return deps.PublicAPIBaseURL
-	}).Register(adminProtected)
+	}, deps.Updates).Register(adminProtected)
 
 	v1 := router.Group("/v1")
+	v1.Use(deps.ConcurrencyGate.Middleware())
 	if deps.TrafficReady != nil {
 		v1.Use(func(c *gin.Context) {
 			if deps.TrafficReady() {

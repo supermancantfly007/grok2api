@@ -255,7 +255,19 @@ curl http://127.0.0.1:8000/v1/responses \
 | 本地或单实例 | SQLite | Memory | 本地目录 |
 | 多实例 | PostgreSQL | Redis | 共享卷或实例亲和 |
 
-可热加载的 Provider（包括 Console 上游地址与 User-Agent）、批量任务并发、路由、媒体容量、审计和代理参数统一在管理端 `/settings` 修改，不需要直接编辑数据库。导入同步、账号转换、数据同步和凭据刷新默认并发均为 `25`，可分别限制为 `1–50`，并支持随机启动延迟；多实例使用 Redis 时，分类上限和总上限均在集群范围内生效。
+Provider（包括 Console 上游地址与 User-Agent）、服务容量、批量任务并发、路由、媒体、审计和代理参数统一在管理端 `/settings` 修改，不需要直接编辑数据库；除页面明确标记“重启生效”的字段外均会热加载。导入同步、账号转换、数据同步和凭据刷新默认并发均为 `25`，可分别限制为 `1–50`，并支持随机启动延迟；多实例使用 Redis 时，分类上限和总上限均在集群范围内生效。
+
+### Resin 粘性代理
+
+出口节点的代理用户名支持 `{account}` 占位符，可直接接入 Resin 的账号租约：
+
+```text
+socks5h://Default.{account}:RESIN_PROXY_TOKEN@resin:2260
+```
+
+运行时会按凭据自动渲染为 `grok_build_<ID>`、`grok_web_<ID>` 或 `grok_console_<ID>`，不同账号使用独立连接池、Resin 租约和 Cloudflare clearance。Web/Console 账号 JSON 可通过 `cloudflare_cookies` 写入账号级 Cookie；账号级配置优先于出口节点的公共 Cookie，敏感值不会通过管理 API 回显。
+
+粘性代理只会在请求尚未写入上游且错误明确属于代理连接阶段时，使用同一账号额外重试两次。`401`、`429`、额度耗尽、永久凭据错误、`UPSTREAM_REQUEST_FAILED`，以及可能已经提交的生成请求都不会在出口层自动重放。
 
 ## 生产部署
 
@@ -292,5 +304,3 @@ pnpm build
 
 - [后端说明](./backend/README.md)
 - [前端说明](./frontend/README.md)
-- [Provider 架构与维护边界](./backend/docs/PROVIDER_ARCHITECTURE.md)
-- [API 与协议兼容范围](./backend/docs/RESPONSES_COMPATIBILITY.md)

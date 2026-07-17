@@ -42,6 +42,7 @@ const responseOwnershipTTL = 30 * 24 * time.Hour
 const finalizationTimeout = 5 * time.Second
 const textBillingReservationTTL = 2 * time.Hour
 const mediaBillingReservationTTL = 24 * time.Hour
+const modelCatalogRefreshTimeout = 30 * time.Second
 
 var freeQuotaUsagePattern = regexp.MustCompile(`(?i)tokens\s*\(actual/limit\)\s*:\s*([0-9]+)\s*/\s*([0-9]+)`)
 
@@ -90,6 +91,10 @@ type routeResolver interface {
 	GetByProviderUpstream(ctx context.Context, providerValue accountdomain.Provider, upstreamModel string) (modeldomain.Route, error)
 }
 
+type accountModelSyncer interface {
+	SyncAccount(ctx context.Context, accountID uint64) (int, error)
+}
+
 // Service 负责模型路由、账号选择、故障切换与审计收口。
 type Service struct {
 	models         routeResolver
@@ -107,6 +112,16 @@ type Service struct {
 	mediaWorker    int
 	mediaQueueFull atomic.Uint64
 	logger         *slog.Logger
+	rateLimitMu    sync.Mutex
+	rateLimits     map[string]teamModelRateLimit
+	rateLimitTeams map[uint64]string
+	modelSyncMu    sync.Mutex
+	modelSyncing   map[uint64]struct{}
+}
+
+type teamModelRateLimit struct {
+	TeamFingerprint string
+	Until           time.Time
 }
 
 func (s *Service) ConfigureMedia(repository repository.MediaJobRepository, concurrency int) {
@@ -120,9 +135,86 @@ func (s *Service) ConfigureMedia(repository repository.MediaJobRepository, concu
 }
 
 func NewService(models routeResolver, audits auditRecorder, accounts *accountapp.Service, clientKeys *clientkeyapp.Service, providers *provider.Registry, selector *Selector, responses repository.ResponseRepository, maxAttempts int) *Service {
-	service := &Service{models: models, audits: audits, accounts: accounts, clientKeys: clientKeys, providers: providers, selector: selector, responses: responses, logger: slog.Default()}
+	service := &Service{
+		models: models, audits: audits, accounts: accounts, clientKeys: clientKeys, providers: providers,
+		selector: selector, responses: responses, logger: slog.Default(),
+		rateLimits: make(map[string]teamModelRateLimit), rateLimitTeams: make(map[uint64]string),
+		modelSyncing: make(map[uint64]struct{}),
+	}
 	service.UpdateMaxAttempts(maxAttempts)
 	return service
+}
+
+func teamModelRateLimitKey(providerValue accountdomain.Provider, teamFingerprint, upstreamModel string) string {
+	return string(providerValue) + "\x00" + teamFingerprint + "\x00" + strings.TrimSpace(upstreamModel)
+}
+
+func rateLimitTeamFingerprint(teamID string) string {
+	teamID = strings.TrimSpace(teamID)
+	if teamID == "" {
+		return ""
+	}
+	return security.HashToken(teamID)
+}
+
+func shortTeamFingerprint(value string) string {
+	if len(value) <= 12 {
+		return value
+	}
+	return value[:12]
+}
+
+func (s *Service) activeTeamModelRateLimit(credential accountdomain.Credential, upstreamModel string, now time.Time) (teamModelRateLimit, bool) {
+	teamFingerprint := rateLimitTeamFingerprint(credential.TeamID)
+	s.rateLimitMu.Lock()
+	defer s.rateLimitMu.Unlock()
+	if teamFingerprint == "" {
+		teamFingerprint = s.rateLimitTeams[credential.ID]
+	}
+	if teamFingerprint == "" {
+		return teamModelRateLimit{}, false
+	}
+	key := teamModelRateLimitKey(credential.Provider, teamFingerprint, upstreamModel)
+	value, ok := s.rateLimits[key]
+	if !ok {
+		return teamModelRateLimit{}, false
+	}
+	if !now.Before(value.Until) {
+		delete(s.rateLimits, key)
+		return teamModelRateLimit{}, false
+	}
+	return value, true
+}
+
+func (s *Service) markTeamModelRateLimit(credential accountdomain.Credential, upstreamModel string, metadata provider.RateLimitMetadata, now time.Time) teamModelRateLimit {
+	retryAfter := metadata.RetryAfter
+	if retryAfter <= 0 {
+		retryAfter = time.Minute
+	}
+	teamFingerprint := rateLimitTeamFingerprint(metadata.TeamID)
+	value := teamModelRateLimit{TeamFingerprint: shortTeamFingerprint(teamFingerprint), Until: now.Add(retryAfter)}
+	key := teamModelRateLimitKey(credential.Provider, teamFingerprint, upstreamModel)
+	until := now.Add(retryAfter)
+	s.rateLimitMu.Lock()
+	if s.rateLimits == nil {
+		s.rateLimits = make(map[string]teamModelRateLimit)
+	}
+	if s.rateLimitTeams == nil {
+		s.rateLimitTeams = make(map[uint64]string)
+	}
+	s.rateLimitTeams[credential.ID] = teamFingerprint
+	for existingKey, value := range s.rateLimits {
+		if !now.Before(value.Until) {
+			delete(s.rateLimits, existingKey)
+		}
+	}
+	if current, ok := s.rateLimits[key]; ok && !current.Until.Before(until) {
+		value = current
+	} else {
+		s.rateLimits[key] = value
+	}
+	s.rateLimitMu.Unlock()
+	return value
 }
 
 func (s *Service) SetLogger(logger *slog.Logger) {
@@ -270,15 +362,27 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if err != nil {
 		return nil, ErrModelNotFound
 	}
-	route, routeErr := s.selectConversationRoute(routes, input.ClientKey, operation, path, input.PreviousResponseID != "", nil)
+	// Select the route first without requiring stored-response support. Console
+	// is intentionally stateless but can still accept a complete input replay;
+	// rejecting it here would prevent the Provider compatibility boundary from
+	// normalizing the request.
+	route, routeErr := s.selectConversationRoute(routes, input.ClientKey, operation, path, false, nil)
 	var ownership *inferencedomain.ResponseOwnership
 	if input.PreviousResponseID != "" && routeErr == nil {
-		value, ownershipErr := s.responses.Get(ctx, input.PreviousResponseID, input.ClientKey.ID, time.Now().UTC())
-		if ownershipErr != nil {
-			return nil, ErrResponseNotFound
+		if s.providers.SupportsStoredResponses(route.Provider) {
+			value, ownershipErr := s.responses.Get(ctx, input.PreviousResponseID, input.ClientKey.ID, time.Now().UTC())
+			if ownershipErr != nil {
+				return nil, ErrResponseNotFound
+			}
+			ownership = &value
+			route, routeErr = s.selectConversationRoute(routes, input.ClientKey, operation, path, true, ownership)
+		} else if route.Provider == accountdomain.ProviderConsole {
+			// Console has no response store. It receives the current request as a
+			// stateless replay; the Provider normalizer removes the stale ID.
+			input.PreviousResponseID = ""
+		} else {
+			return nil, ErrResponseStateUnsupported
 		}
-		ownership = &value
-		route, routeErr = s.selectConversationRoute(routes, input.ClientKey, operation, path, true, ownership)
 	}
 	publicModel := modeldomain.ExternalPublicID(route.Provider, route.PublicID)
 	input.PublicModel = publicModel
@@ -390,10 +494,21 @@ attemptLoop:
 			}
 			break
 		}
+		excluded[lease.Credential.ID] = true
+		if limited, ok := s.activeTeamModelRateLimit(lease.Credential, route.UpstreamModel, time.Now().UTC()); ok {
+			lease.Release()
+			lastFailure = &UpstreamFailure{
+				HTTPStatus: http.StatusTooManyRequests, Code: "upstream_rate_limited", PublicMessage: "上游请求频率受限",
+				Fingerprint: "429:team_model_rate_limit", RetryAfter: time.Until(limited.Until),
+			}
+			lastErr = fmt.Errorf("上游 Team 与模型请求频率受限")
+			s.logger.Warn("upstream_team_model_rate_limit_active", "request_id", input.RequestID, "provider", route.Provider, "model", route.UpstreamModel, "team_fingerprint", limited.TeamFingerprint, "retry_after", lastFailure.RetryAfter.Round(time.Second))
+			attempt--
+			continue
+		}
 		if lease.QuotaProbe {
 			quotaProbeAttempted = true
 		}
-		excluded[lease.Credential.ID] = true
 		if lease.QuotaProbeKind == accountdomain.QuotaRecoveryKindPaid {
 			recovered, probeErr := s.accounts.ProbePaidQuota(ctx, lease.Credential)
 			s.selector.MarkQuotaStateChanged(lease.Credential.Provider)
@@ -429,6 +544,9 @@ attemptLoop:
 			continue
 		}
 	handleResponse:
+		if response.ModelCatalogChanged {
+			s.queueAccountModelSync(credential.ID)
+		}
 		if response.StatusCode == http.StatusUnauthorized {
 			response.Body.Close()
 			if credential.AuthType == accountdomain.AuthTypeSSO {
@@ -439,6 +557,12 @@ attemptLoop:
 				lastFailure = newHTTPUpstreamFailure(http.StatusUnauthorized, nil, credential.ID, credential.Name)
 				continue
 			}
+			if s.markPermanentlyUnrefreshableCredentialRejected(ctx, credential) {
+				lease.Release()
+				lastErr = accountapp.ErrCredentialRefreshPermanent
+				lastFailure = newHTTPUpstreamFailure(http.StatusUnauthorized, nil, credential.ID, credential.Name)
+				continue
+			}
 			authRecoveryAttempted[credential.ID] = true
 			refreshed, refreshErr := ensureCredential(credential, true)
 			if refreshErr == nil {
@@ -446,6 +570,9 @@ attemptLoop:
 				credential = refreshed
 			}
 			if refreshErr != nil || err != nil {
+				if errors.Is(refreshErr, accountapp.ErrCredentialRefreshPermanent) {
+					s.markCredentialRejectedAfterPermanentRefresh(ctx, credential)
+				}
 				lease.Release()
 				lastErr = firstError(refreshErr, err)
 				if refreshErr != nil {
@@ -470,7 +597,7 @@ attemptLoop:
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
 		finalEgressForbidden := egressForbidden && (attempt > 0 || attempt+1 >= attempts)
-		if isRetryable(response.StatusCode) && !finalEgressForbidden {
+		if isRetryableResponse(response) && !finalEgressForbidden {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
 			if egressForbidden {
@@ -482,6 +609,16 @@ attemptLoop:
 				continue
 			}
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			if response.StatusCode == http.StatusTooManyRequests && response.RateLimit != nil && response.RateLimit.TeamID != "" && response.RateLimit.Model == route.UpstreamModel {
+				limited := s.markTeamModelRateLimit(credential, route.UpstreamModel, *response.RateLimit, time.Now().UTC())
+				lastFailure.AccountScoped = false
+				lastFailure.Fingerprint = "429:team_model_rate_limit"
+				lastFailure.RetryAfter = time.Until(limited.Until)
+				lease.Release()
+				lastErr = fmt.Errorf("上游 Team 与模型请求频率受限")
+				s.logger.Warn("upstream_team_model_rate_limited", "request_id", input.RequestID, "provider", credential.Provider, "model", route.UpstreamModel, "team_fingerprint", limited.TeamFingerprint, "scope", response.RateLimit.Scope, "actual", response.RateLimit.Actual, "limit", response.RateLimit.Limit, "retry_after", lastFailure.RetryAfter)
+				continue
+			}
 			if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
 				authRecoveryAttempted[credential.ID] = true
 				refreshed, refreshErr := ensureCredential(credential, true)
@@ -663,6 +800,43 @@ attemptLoop:
 	return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, lastErr)
 }
 
+func (s *Service) queueAccountModelSync(accountID uint64) {
+	syncer, ok := s.models.(accountModelSyncer)
+	if !ok || accountID == 0 {
+		return
+	}
+	s.modelSyncMu.Lock()
+	if s.modelSyncing == nil {
+		s.modelSyncing = make(map[uint64]struct{})
+	}
+	if _, exists := s.modelSyncing[accountID]; exists {
+		s.modelSyncMu.Unlock()
+		return
+	}
+	s.modelSyncing[accountID] = struct{}{}
+	s.modelSyncMu.Unlock()
+
+	go func() {
+		defer func() {
+			s.modelSyncMu.Lock()
+			delete(s.modelSyncing, accountID)
+			s.modelSyncMu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), modelCatalogRefreshTimeout)
+		defer cancel()
+		logger := s.logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		count, err := syncer.SyncAccount(ctx, accountID)
+		if err != nil {
+			logger.Warn("model_etag_refresh_failed", "account_id", accountID, "error", err)
+			return
+		}
+		logger.Info("model_etag_refresh_completed", "account_id", accountID, "models", count)
+	}()
+}
+
 func rewriteAliasedModel(body []byte, publicModel, reasoningEffort string, operation audit.Operation) ([]byte, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -696,236 +870,6 @@ type ResourceInput struct {
 	ClientKey  clientkey.Key
 	ResponseID string
 	RawQuery   string
-}
-
-type ImageGenerationInput struct {
-	RequestID      string
-	ClientKey      clientkey.Key
-	PublicModel    string
-	Prompt         string
-	Count          int
-	Size           string
-	AspectRatio    string
-	Resolution     string
-	ResponseFormat string
-	Streaming      bool
-}
-
-type ImageEditInput struct {
-	RequestID      string
-	ClientKey      clientkey.Key
-	PublicModel    string
-	Prompt         string
-	ImageURLs      []string
-	Count          int
-	Resolution     string
-	ResponseFormat string
-}
-
-func (s *Service) GenerateImage(ctx context.Context, input ImageGenerationInput) (*Result, error) {
-	return s.executeImage(ctx, input.RequestID, input.ClientKey, input.PublicModel, audit.OperationImage, func(executionCtx context.Context, adapter provider.ImageAdapter, credential accountdomain.Credential, upstream string) (*provider.Response, error) {
-		return adapter.GenerateImage(executionCtx, provider.ImageGenerationRequest{
-			Credential: credential, Model: upstream, Prompt: input.Prompt, Count: input.Count,
-			Size: input.Size, AspectRatio: input.AspectRatio, Resolution: input.Resolution,
-			ResponseFormat: input.ResponseFormat, Streaming: input.Streaming,
-		})
-	}, input.Streaming, input.Resolution, input.Count, 0)
-}
-
-func (s *Service) EditImage(ctx context.Context, input ImageEditInput) (*Result, error) {
-	return s.executeImage(ctx, input.RequestID, input.ClientKey, input.PublicModel, audit.OperationImageEdit, func(executionCtx context.Context, adapter provider.ImageAdapter, credential accountdomain.Credential, upstream string) (*provider.Response, error) {
-		return adapter.EditImage(executionCtx, provider.ImageEditRequest{
-			Credential: credential, Model: upstream, Prompt: input.Prompt,
-			ImageURLs: input.ImageURLs, Count: input.Count, Resolution: input.Resolution, ResponseFormat: input.ResponseFormat,
-		})
-	}, false, input.Resolution, input.Count, len(input.ImageURLs))
-}
-
-func (s *Service) executeImage(ctx context.Context, requestID string, key clientkey.Key, publicModel string, operation audit.Operation, execute func(context.Context, provider.ImageAdapter, accountdomain.Credential, string) (*provider.Response, error), streaming bool, resolution string, requestedCount, inputImageCount int) (*Result, error) {
-	ctx, egressTrace := infraegress.WithTrace(ctx)
-	startedAt := time.Now()
-	eventID := newAuditEventID()
-	routes, err := s.models.GetByPublicIDCandidates(ctx, publicModel)
-	if err != nil {
-		return nil, ErrModelNotFound
-	}
-	capability := modeldomain.CapabilityImage
-	if operation == audit.OperationImageEdit {
-		capability = modeldomain.CapabilityImageEdit
-	}
-	route, err := s.selectMediaRoute(routes, key, capability, func(providerValue accountdomain.Provider) bool {
-		_, ok := s.providers.Images(providerValue)
-		return ok
-	})
-	if err != nil {
-		return nil, err
-	}
-	externalModel := modeldomain.ExternalPublicID(route.Provider, route.PublicID)
-	adapter, ok := s.providers.Images(route.Provider)
-	if !ok {
-		return nil, ErrNoAvailableAccount
-	}
-	auditBase := audit.Record{
-		EventID: eventID, RequestID: requestID, ClientKeyID: key.ID, ClientKeyName: key.Name,
-		ModelRouteID: route.ID, ModelPublicID: externalModel, ModelUpstreamModel: modeldomain.DisplayUpstreamModel(route.Provider, route.UpstreamModel),
-		Provider: string(route.Provider), Operation: operation, UsageSource: audit.UsageSourceNone, Streaming: streaming,
-	}
-	if operation == audit.OperationImageEdit {
-		auditBase.MediaInputImages = int64(max(0, inputImageCount))
-	}
-	writeFailureAudit := func(statusCode int, errorCode string, credential *accountdomain.Credential) {
-		record := auditBase
-		record.StatusCode = statusCode
-		record.ErrorCode = errorCode
-		record.DurationMS = time.Since(startedAt).Milliseconds()
-		record.CreatedAt = time.Now().UTC()
-		if credential != nil {
-			accountID := credential.ID
-			record.AccountID = &accountID
-			record.AccountName = credential.Name
-		}
-		applyAuditEgress(&record, egressTrace, route.Provider)
-		persistCtx, cancel := context.WithTimeout(context.Background(), finalizationTimeout)
-		defer cancel()
-		if auditErr := s.audits.Create(persistCtx, record); auditErr != nil {
-			s.logger.Error("request_usage_write_failed", "event_id", record.EventID, "request_id", requestID, "error", auditErr)
-		}
-	}
-	pricingModel := s.providers.PricingModel(route.Provider, route.UpstreamModel)
-	var reservation audit.PricingResult
-	var priced bool
-	switch operation {
-	case audit.OperationImage:
-		reservation, priced = audit.EstimateOfficialImageCost(pricingModel, resolution, requestedCount)
-	case audit.OperationImageEdit:
-		reservation, priced = audit.EstimateOfficialImageEditCost(pricingModel, resolution, requestedCount, inputImageCount)
-	}
-	reserved := false
-	if priced {
-		reserved, err = s.clientKeys.ReserveBilling(ctx, key, eventID, reservation.CostInUSDTicks, mediaBillingReservationTTL)
-		if err != nil {
-			return nil, err
-		}
-	}
-	finalizationOwnsReservation := false
-	defer func() {
-		if reserved && !finalizationOwnsReservation {
-			s.cancelBillingReservation(eventID)
-		}
-	}()
-	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
-	attempts := int(s.maxAttempts.Load())
-	if attempts <= 0 {
-		attempts = 3
-	}
-	excluded := make(map[uint64]bool)
-	var lease *accountLease
-	var credential accountdomain.Credential
-	var response *provider.Response
-	var lastCredentialFailure *accountdomain.Credential
-	for attempt := 0; attempt < attempts; attempt++ {
-		lease, err = s.selector.Acquire(ctx, route.Provider, route.UpstreamModel, quotaMode, "", excluded, false)
-		if err != nil {
-			writeFailureAudit(http.StatusServiceUnavailable, "upstream_unavailable", lastCredentialFailure)
-			return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, err)
-		}
-		excluded[lease.Credential.ID] = true
-		credential, err = s.accounts.EnsureCredential(ctx, lease.Credential, false)
-		if err != nil {
-			s.logger.Error("image_credential_failed", "event_id", eventID, "request_id", requestID, "model", externalModel, "provider", route.Provider, "account_id", lease.Credential.ID, "error", err)
-			failedCredential := lease.Credential
-			lastCredentialFailure = &failedCredential
-			lease.Release()
-			continue
-		}
-		response, err = execute(ctx, adapter, credential, route.UpstreamModel)
-		if err != nil {
-			s.logger.Error("image_upstream_failed", "event_id", eventID, "request_id", requestID, "model", externalModel, "provider", route.Provider, "account_id", credential.ID, "error", err)
-			if !provider.IsMediaPostProcessingError(err) {
-				s.selector.MarkFailure(ctx, credential, 0, 0)
-			}
-			lease.Release()
-			errorCode := "upstream_unavailable"
-			if provider.IsMediaPostProcessingError(err) {
-				errorCode = "media_postprocessing_failed"
-			}
-			writeFailureAudit(http.StatusBadGateway, errorCode, &credential)
-			return nil, err
-		}
-		if s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden && attempt == 0 && attempt+1 < attempts {
-			_, _ = readRetryableBody(response.Body)
-			lease.Release()
-			delete(excluded, credential.ID)
-			continue
-		}
-		if quotaKind, _ := s.providers.QuotaKind(credential.Provider); quotaKind == provider.QuotaRemoteWindow && response.StatusCode == http.StatusTooManyRequests && lease.QuotaMode != "" {
-			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
-			exhausted, reconcileErr := s.accounts.ReconcileWebRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
-			s.selector.MarkQuotaStateChanged(credential.Provider)
-			if reconcileErr != nil || !exhausted {
-				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
-			}
-			if attempt+1 < attempts {
-				_, _ = readRetryableBody(response.Body)
-				lease.Release()
-				continue
-			}
-		}
-		break
-	}
-	if response.StatusCode == http.StatusUnauthorized && credential.AuthType == accountdomain.AuthTypeSSO {
-		_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
-		s.selector.MarkFailure(ctx, credential, http.StatusUnauthorized, 0)
-	}
-	effectiveQuotaMode := lease.QuotaMode
-	accountID := credential.ID
-	var once sync.Once
-	finalize := func(_ Usage, _ string, errorCode string) {
-		once.Do(func() {
-			lease.Release()
-			persistCtx, cancel := context.WithTimeout(context.Background(), finalizationTimeout)
-			defer cancel()
-			record := auditBase
-			record.AccountID, record.AccountName, record.StatusCode = &accountID, credential.Name, response.StatusCode
-			record.ErrorCode = errorCode
-			record.DurationMS, record.CreatedAt = time.Since(startedAt).Milliseconds(), time.Now().UTC()
-			applyAuditEgress(&record, egressTrace, route.Provider)
-			if response.StatusCode >= 200 && response.StatusCode < 300 && errorCode == "" {
-				record.MediaOutputImages = int64(max(0, requestedCount))
-				var pricing audit.PricingResult
-				var priced bool
-				switch operation {
-				case audit.OperationImage:
-					pricing, priced = audit.EstimateOfficialImageCost(pricingModel, resolution, requestedCount)
-				case audit.OperationImageEdit:
-					pricing, priced = audit.EstimateOfficialImageEditCost(pricingModel, resolution, requestedCount, inputImageCount)
-				}
-				if priced {
-					record.EstimatedCostInUSDTicks = pricing.CostInUSDTicks
-					record.PricingModel = pricing.Model
-					record.PricingVersion = audit.OfficialPricingAsOf
-				}
-			}
-			if err := s.audits.Create(persistCtx, record); err != nil {
-				s.logger.Error("request_usage_write_failed", "event_id", record.EventID, "request_id", requestID, "error", err)
-			}
-			quotaKind, _ := s.providers.QuotaKind(route.Provider)
-			if response.StatusCode >= 200 && response.StatusCode < 300 && errorCode == "" && quotaKind == provider.QuotaRemoteWindow && effectiveQuotaMode != "" {
-				if effectiveQuotaMode != "weekly" {
-					units := max(1, response.QuotaUnits)
-					updated, err := s.accounts.DecrementWebQuota(persistCtx, accountID, effectiveQuotaMode, units)
-					if err != nil {
-						s.logger.Warn("web_quota_decrement_failed", "account_id", accountID, "mode", effectiveQuotaMode, "units", units, "error", err)
-					} else if updated {
-						s.selector.ConsumeQuota(route.Provider, accountID, effectiveQuotaMode, units)
-					}
-				}
-				s.accounts.QueueQuotaRefresh(accountID, effectiveQuotaMode)
-			}
-		})
-	}
-	finalizationOwnsReservation = true
-	return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, Finalize: finalize}, nil
 }
 
 func (s *Service) cancelBillingReservation(eventID string) {
@@ -985,8 +929,15 @@ func (s *Service) forwardOwnedResponse(ctx context.Context, input ResourceInput,
 	}
 	if response.StatusCode == http.StatusUnauthorized {
 		response.Body.Close()
+		if s.markPermanentlyUnrefreshableCredentialRejected(ctx, credential) {
+			lease.Release()
+			return nil, fmt.Errorf("%w: %w", ErrResponseAccountUnavailable, accountapp.ErrCredentialRefreshPermanent)
+		}
 		refreshed, refreshErr := s.accounts.EnsureCredential(ctx, credential, true)
 		if refreshErr != nil {
+			if errors.Is(refreshErr, accountapp.ErrCredentialRefreshPermanent) {
+				s.markCredentialRejectedAfterPermanentRefresh(ctx, credential)
+			}
 			lease.Release()
 			return nil, refreshErr
 		}
@@ -1009,6 +960,20 @@ func (s *Service) forwardOwnedResponse(ctx context.Context, input ResourceInput,
 	release := func() { once.Do(lease.Release) }
 	finalize := func(Usage, string, string) { release() }
 	return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: release}, Finalize: finalize}, nil
+}
+
+// markPermanentlyUnrefreshableCredentialRejected 在真实上游请求确认 access token 失效后立即移出账号池。
+func (s *Service) markPermanentlyUnrefreshableCredentialRejected(ctx context.Context, credential accountdomain.Credential) bool {
+	if !credential.RefreshPermanent {
+		return false
+	}
+	s.markCredentialRejectedAfterPermanentRefresh(ctx, credential)
+	return true
+}
+
+func (s *Service) markCredentialRejectedAfterPermanentRefresh(ctx context.Context, credential accountdomain.Credential) {
+	_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s OAuth access token rejected after permanent refresh failure", credential.Provider))
+	s.selector.MarkQuotaStateChanged(credential.Provider)
 }
 
 func readRetryableBody(body io.ReadCloser) ([]byte, error) {
@@ -1052,6 +1017,13 @@ func (b *finalizingBody) Close() error {
 
 func isRetryable(status int) bool {
 	return status == 402 || status == 403 || status == 429 || status >= 500
+}
+
+func isRetryableResponse(response *provider.Response) bool {
+	if response == nil || !isRetryable(response.StatusCode) {
+		return false
+	}
+	return !strings.EqualFold(strings.TrimSpace(response.Header.Get("X-Should-Retry")), "false")
 }
 
 func parseRetryAfter(value string, now time.Time) time.Duration {

@@ -16,6 +16,7 @@ export type BillingDTO = {
   prepaidBalance: number;
   creditUsagePercent: number;
   isUnifiedBillingUser: boolean;
+  onDemandEnabled?: boolean;
   topUpMethod?: string;
   usagePeriodType?: string;
   usagePeriodStart?: string;
@@ -29,6 +30,9 @@ export type BillingDTO = {
 export type BillingHistoryDTO = {
   year: number;
   month: number;
+  periodType?: string;
+  periodStart?: string;
+  periodEnd?: string;
   includedUsed: number;
   onDemandUsed: number;
   totalUsed: number;
@@ -69,6 +73,7 @@ export type AccountDTO = {
   authStatus: "active" | "reauthRequired";
   expiresAt?: string;
   refreshable: boolean;
+  cloudflareCookieConfigured: boolean;
   refreshDueAt?: string;
   lastRefreshAt?: string;
   refreshFailureCount: number;
@@ -95,6 +100,8 @@ export type AccountUpdateInput = {
   priority: number;
   maxConcurrent: number;
   minimumRemaining: number;
+  cloudflareCookies?: string;
+  clearCloudflareCookies?: boolean;
 };
 
 export type AccountSummaryDTO = {
@@ -124,12 +131,13 @@ export type DevicePollDTO = {
 };
 
 const billingHistoryValidator = hasShape({
-  year: isNumber, month: isNumber, includedUsed: isNumber, onDemandUsed: isNumber, totalUsed: isNumber,
+  year: isNumber, month: isNumber, periodType: isOptional(isString), periodStart: isOptional(isString), periodEnd: isOptional(isString),
+  includedUsed: isNumber, onDemandUsed: isNumber, totalUsed: isNumber,
 });
 const billingValidator = hasShape({
   planCode: isOptional(isString), planName: isOptional(isString), monthlyLimit: isNumber, used: isNumber, remaining: isNumber,
   onDemandCap: isNumber, onDemandUsed: isNumber, prepaidBalance: isNumber, creditUsagePercent: isNumber,
-  isUnifiedBillingUser: isBoolean, topUpMethod: isOptional(isString), usagePeriodType: isOptional(isString),
+  isUnifiedBillingUser: isBoolean, onDemandEnabled: isOptional(isBoolean), topUpMethod: isOptional(isString), usagePeriodType: isOptional(isString),
   usagePeriodStart: isOptional(isString), usagePeriodEnd: isOptional(isString), billingPeriodStart: isOptional(isString),
   billingPeriodEnd: isOptional(isString), history: isOptional(isArrayOf(billingHistoryValidator)), syncedAt: isString,
 });
@@ -149,7 +157,7 @@ const quotaWindowValidator = hasShape({
 const accountValidator = hasShape({
   id: isString, provider: isOneOf("grok_build", "grok_web", "grok_console"), authType: isOneOf("oauth", "sso"), webTier: isOptional(isOneOf("auto", "basic", "super", "heavy")),
   webTierSyncedAt: isOptional(isString), name: isString, email: isOptional(isString), userId: isOptional(isString), teamId: isOptional(isString),
-  enabled: isBoolean, authStatus: isOneOf("active", "reauthRequired"), expiresAt: isOptional(isString), refreshable: isBoolean,
+  enabled: isBoolean, authStatus: isOneOf("active", "reauthRequired"), expiresAt: isOptional(isString), refreshable: isBoolean, cloudflareCookieConfigured: isBoolean,
   refreshDueAt: isOptional(isString), lastRefreshAt: isOptional(isString), refreshFailureCount: isNumber,
   lastRefreshErrorCode: isOptional(isString), priority: isNumber, maxConcurrent: isNumber, minimumRemaining: isNumber,
   failureCount: isNumber, cooldownUntil: isOptional(isString), lastError: isOptional(isString), lastUsedAt: isOptional(isString),
@@ -231,11 +239,17 @@ export type BuildConversionResultDTO = {
   syncFailed: number;
 };
 
-export type BuildConversionInput =
-  | { all: true; ids?: never }
-  | { all?: false; ids: string[] };
+export type AccountSyncStrategy = "missing" | "all";
+export type BuildConversionStrategy = AccountSyncStrategy;
+export type WebConsoleSyncStrategy = AccountSyncStrategy;
 
-export type WebConsoleSyncInput = BuildConversionInput;
+export type BuildConversionInput =
+  | { all: true; ids?: never; strategy?: BuildConversionStrategy }
+  | { all?: false; ids: string[]; strategy?: BuildConversionStrategy };
+
+export type WebConsoleSyncInput =
+  | { all: true; ids?: never; strategy: WebConsoleSyncStrategy }
+  | { all?: false; ids: string[]; strategy: WebConsoleSyncStrategy };
 
 export type AccountTaskProgressDTO = {
   completed: number;
@@ -283,6 +297,8 @@ export type AccountImportResultDTO = {
   synced: number;
   syncFailed: number;
 };
+
+export type WebConsoleSyncResultDTO = AccountImportResultDTO & { skipped: number };
 
 type AccountTaskStreamPayload = Partial<BuildConversionResultDTO & AccountTaskProgressDTO & AccountTokenRefreshResultDTO & AccountImportResultDTO & Omit<HealthProbeSummaryDTO, "error" | "items">> & {
   code?: string;
@@ -500,8 +516,8 @@ export function convertWebAccountsToBuild(input: BuildConversionInput, onProgres
   return runAccountTask("/api/admin/v1/accounts/web/convert-to-build", input, ["created", "linked", "skipped", "failed", "synced", "syncFailed"], onProgress, signal);
 }
 
-export function syncWebAccountsToConsole(input: WebConsoleSyncInput, onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountImportResultDTO> {
-  return runAccountTask("/api/admin/v1/accounts/web/sync-to-console", input, ["created", "updated", "synced", "syncFailed"], onProgress, signal);
+export function syncWebAccountsToConsole(input: WebConsoleSyncInput, onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<WebConsoleSyncResultDTO> {
+  return runAccountTask("/api/admin/v1/accounts/web/sync-to-console", input, ["created", "updated", "skipped", "synced", "syncFailed"], onProgress, signal);
 }
 
 export function importAccounts(files: readonly File[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountImportResultDTO> {
@@ -534,8 +550,8 @@ export function updateAccountsEnabled(ids: string[], enabled: boolean, provider:
   return apiRequest("/api/admin/v1/accounts/batch", { method: "PATCH", body: { ids, enabled, provider } }, decodeCountResult<{ updated: number }>("updated"));
 }
 
-export function refreshAccountsBilling(ids: string[], provider: AccountProvider): Promise<{ succeeded: number; failed: number }> {
-  return apiRequest("/api/admin/v1/accounts/batch/refresh-billing", { method: "POST", body: { ids, provider } }, createObjectDecoder("account batch", { succeeded: isNumber, failed: isNumber }));
+export function refreshAccountsQuota(ids: string[], provider: AccountProvider): Promise<{ succeeded: number; failed: number }> {
+  return apiRequest("/api/admin/v1/accounts/batch/refresh-quotas", { method: "POST", body: { ids, provider } }, createObjectDecoder("account batch", { succeeded: isNumber, failed: isNumber }));
 }
 
 export function deleteAccounts(ids: string[], provider: AccountProvider): Promise<{ deleted: number }> {

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,54 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
+
+func TestQueueAccountModelSyncDeduplicatesConcurrentETagRefresh(t *testing.T) {
+	resolver := &etagSyncResolver{started: make(chan uint64, 2), release: make(chan struct{})}
+	service := &Service{models: resolver, logger: slog.Default(), modelSyncing: make(map[uint64]struct{})}
+	service.queueAccountModelSync(42)
+	service.queueAccountModelSync(42)
+	select {
+	case accountID := <-resolver.started:
+		if accountID != 42 {
+			t.Fatalf("account id = %d", accountID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("模型 ETag 刷新未启动")
+	}
+	if calls := resolver.calls.Load(); calls != 1 {
+		t.Fatalf("concurrent sync calls = %d", calls)
+	}
+	close(resolver.release)
+}
+
+type etagSyncResolver struct {
+	calls   atomic.Int64
+	started chan uint64
+	release chan struct{}
+}
+
+func (r *etagSyncResolver) SyncAccount(_ context.Context, accountID uint64) (int, error) {
+	r.calls.Add(1)
+	r.started <- accountID
+	<-r.release
+	return 1, nil
+}
+
+func (r *etagSyncResolver) Get(context.Context, uint64) (modeldomain.Route, error) {
+	return modeldomain.Route{}, repository.ErrNotFound
+}
+
+func (r *etagSyncResolver) GetByPublicID(context.Context, string) (modeldomain.Route, error) {
+	return modeldomain.Route{}, repository.ErrNotFound
+}
+
+func (r *etagSyncResolver) GetByPublicIDCandidates(context.Context, string) ([]modeldomain.Route, error) {
+	return nil, repository.ErrNotFound
+}
+
+func (r *etagSyncResolver) GetByProviderUpstream(context.Context, account.Provider, string) (modeldomain.Route, error) {
+	return modeldomain.Route{}, repository.ErrNotFound
+}
 
 func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	ctx := context.Background()
@@ -159,6 +208,88 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	}
 }
 
+func TestGatewayTeamModelRateLimitOnlySkipsMatchingTeam(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "team-model-rate-limit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	credentials := make([]account.Credential, 0, 3)
+	for index, seed := range []struct {
+		name   string
+		teamID string
+	}{{"console-team-a-first", "team-a"}, {"console-team-a-second", "team-a"}, {"console-team-b", "team-b"}} {
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO, Name: seed.name, SourceKey: seed.name, TeamID: seed.teamID,
+			EncryptedAccessToken: "encrypted-" + seed.name, Enabled: true, AuthStatus: account.AuthStatusActive,
+			Priority: 200 - index, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		credentials = append(credentials, credential)
+	}
+	models := []string{"grok-console-team-rate-limit", "grok-console-team-rate-limit-other"}
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderConsole, models); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, credential := range credentials {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, models, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "team-model-key", Prefix: "team-model", SecretHash: strings.Repeat("d", 64), EncryptedSecret: "encrypted-key",
+		Enabled: true, RPMLimit: 60, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := &teamModelRateLimitConsoleAdapter{rateLimitedTeam: "team-a"}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+
+	assertSuccess := func(requestID, publicModel string) {
+		t.Helper()
+		result, err := service.CreateResponse(ctx, Input{
+			RequestID: requestID, ClientKey: key, PublicModel: publicModel,
+			Body: []byte(`{"model":"` + publicModel + `","input":"hello"}`),
+		})
+		if err != nil || result == nil || result.StatusCode != http.StatusOK {
+			t.Fatalf("result = %#v, err = %v", result, err)
+		}
+		_ = result.Body.Close()
+		result.Finalize(Usage{}, "", "")
+	}
+
+	assertSuccess("req-team-model-first", models[0])
+	if attempts := adapter.Attempts(); len(attempts) != 2 || attempts[0].AccountID != credentials[0].ID || attempts[1].AccountID != credentials[2].ID {
+		t.Fatalf("first attempts = %#v, want first Team A account then Team B account", attempts)
+	}
+	assertSuccess("req-team-model-cached", models[0])
+	if attempts := adapter.Attempts(); len(attempts) != 3 || attempts[2].AccountID != credentials[2].ID {
+		t.Fatalf("cached Team A accounts should be skipped in favor of Team B, attempts = %#v", attempts)
+	}
+	assertSuccess("req-team-model-other", models[1])
+	if attempts := adapter.Attempts(); len(attempts) != 5 || attempts[3].AccountID != credentials[0].ID || attempts[3].Model != models[1] || attempts[4].AccountID != credentials[2].ID {
+		t.Fatalf("different model should have an independent Team limit, attempts = %#v", attempts)
+	}
+}
+
 func TestSelectConversationRouteRespectsClientKeyAcrossSharedPublicModel(t *testing.T) {
 	registry := provider.NewRegistry(&failoverAdapter{}, statelessConsoleAdapter{})
 	service := &Service{
@@ -186,11 +317,62 @@ func TestSelectMediaRouteSkipsSameNamedConversationRoute(t *testing.T) {
 		{ID: 20, PublicID: "Web/grok-shared", Provider: account.ProviderWeb, UpstreamModel: "grok-shared", Capability: modeldomain.CapabilityImage},
 	}
 	selected, err := service.selectMediaRoute(routes, clientkey.Key{}, modeldomain.CapabilityImage, func(providerValue account.Provider) bool {
-		_, ok := registry.Images(providerValue)
+		_, ok := registry.ImageGeneration(providerValue)
 		return ok
 	})
 	if err != nil || selected.ID != 20 {
 		t.Fatalf("selected route = %#v, err = %v", selected, err)
+	}
+}
+
+func TestGenerateImageReturnsWhenEveryCredentialRefreshFails(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "image-credential-failure.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	now := time.Now().UTC()
+	credential, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth,
+		Name: "expired-image", SourceKey: "expired-image", EncryptedAccessToken: "expired", EncryptedRefreshToken: "refresh",
+		ExpiresAt: now.Add(-time.Minute), Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.UpsertRoutes(ctx, []modeldomain.Route{{
+		PublicID: "image-credential-failure", Provider: account.ProviderBuild, UpstreamModel: "image-credential-failure",
+		Capability: modeldomain.CapabilityImage, Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"image-credential-failure"}, now); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &credentialFailureImageAdapter{}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 1)
+
+	_, err = service.GenerateImage(ctx, ImageGenerationInput{
+		RequestID: "req-image-credential-failure", ClientKey: clientkey.Key{ID: 1, Name: "image-key"},
+		PublicModel: "image-credential-failure", Prompt: "test", Count: 1, ResponseFormat: "url",
+	})
+	if !errors.Is(err, ErrNoAvailableAccount) {
+		t.Fatalf("error = %v", err)
+	}
+	if adapter.generationCalls.Load() != 0 {
+		t.Fatalf("generation calls = %d", adapter.generationCalls.Load())
 	}
 }
 
@@ -247,9 +429,13 @@ func TestGatewayDoesNotPersistStatelessConsoleResponses(t *testing.T) {
 	if _, err := responseRepo.Get(ctx, "resp-console", key.ID, time.Now().UTC()); !errors.Is(err, repository.ErrNotFound) {
 		t.Fatalf("stateless response ownership err = %v", err)
 	}
-	if _, err := service.CreateResponse(ctx, Input{RequestID: "req-console-next", ClientKey: key, PublicModel: model, PreviousResponseID: "resp-console", Body: []byte(`{"model":"grok-console-stateless","previous_response_id":"resp-console"}`)}); !errors.Is(err, ErrResponseStateUnsupported) {
-		t.Fatalf("previous response error = %v", err)
+	continued, err := service.CreateResponse(ctx, Input{RequestID: "req-console-next", ClientKey: key, PublicModel: model, PreviousResponseID: "resp-console", Body: []byte(`{"model":"grok-console-stateless","previous_response_id":"resp-console","input":"hello again"}`)})
+	if err != nil {
+		t.Fatalf("Console stateless previous response fallback = %v", err)
 	}
+	_, _ = io.ReadAll(continued.Body)
+	continued.Finalize(Usage{}, "resp-console-next", "")
+	_ = continued.Body.Close()
 	if _, err := service.CompactResponse(ctx, Input{RequestID: "req-console-compact", ClientKey: key, PublicModel: model, Body: []byte(`{"model":"grok-console-stateless","input":"hello"}`)}); !errors.Is(err, ErrConversationUnsupported) {
 		t.Fatalf("compact response error = %v", err)
 	}
@@ -425,6 +611,23 @@ func TestGatewayRefreshesAndRetriesBuildPermissionDenialOnce(t *testing.T) {
 	}
 	if updated.EncryptedAccessToken != "access-new" || updated.AuthStatus != account.AuthStatusActive || updated.RefreshFailureCount != 0 {
 		t.Fatalf("updated credential = %#v", updated)
+	}
+	if err := accountRepo.UpdateCredentialRefreshFailure(ctx, credential.ID, 1, updated.ExpiresAt, "invalid_grant", true); err != nil {
+		t.Fatal(err)
+	}
+	adapter.rejectAll.Store(true)
+	if _, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-rejected", ClientKey: clientKey, PublicModel: "grok-rescue",
+		Body: []byte(`{"model":"grok-rescue","input":"hello again"}`),
+	}); err == nil {
+		t.Fatal("rejected access token unexpectedly succeeded")
+	}
+	rejected, err := accountRepo.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejected.AuthStatus != account.AuthStatusReauthRequired || adapter.refreshes.Load() != 1 {
+		t.Fatalf("rejected credential = %#v, refreshes = %d", rejected, adapter.refreshes.Load())
 	}
 }
 
@@ -825,6 +1028,17 @@ type failoverAdapter struct {
 
 type statelessConsoleAdapter struct{}
 
+type teamModelRateLimitConsoleAttempt struct {
+	AccountID uint64
+	Model     string
+}
+
+type teamModelRateLimitConsoleAdapter struct {
+	mu              sync.Mutex
+	attempts        []teamModelRateLimitConsoleAttempt
+	rateLimitedTeam string
+}
+
 func (statelessConsoleAdapter) Provider() account.Provider { return account.ProviderConsole }
 func (statelessConsoleAdapter) Definition() provider.Definition {
 	return provider.Definition{
@@ -841,6 +1055,37 @@ func (statelessConsoleAdapter) ForwardResponse(context.Context, provider.Respons
 	}, nil
 }
 
+func (a *teamModelRateLimitConsoleAdapter) Provider() account.Provider {
+	return account.ProviderConsole
+}
+func (a *teamModelRateLimitConsoleAdapter) Definition() provider.Definition {
+	return testConversationDefinition(account.ProviderConsole)
+}
+func (a *teamModelRateLimitConsoleAdapter) ForwardResponse(_ context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
+	a.mu.Lock()
+	a.attempts = append(a.attempts, teamModelRateLimitConsoleAttempt{AccountID: request.Credential.ID, Model: request.Model})
+	a.mu.Unlock()
+	if request.Credential.TeamID != a.rateLimitedTeam {
+		return &provider.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{"Content-Type": {"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{"id":"resp-team-success","object":"response","status":"completed"}`)),
+		}, nil
+	}
+	return &provider.Response{
+		StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests", Header: http.Header{"Content-Type": {"application/json"}},
+		Body: io.NopCloser(strings.NewReader(`{"error":"team model rate limited"}`)),
+		RateLimit: &provider.RateLimitMetadata{
+			Scope: provider.RateLimitScopeRPM, TeamID: request.Credential.TeamID, Model: request.Model,
+			Actual: 61, Limit: 60, RetryAfter: time.Hour,
+		},
+	}, nil
+}
+func (a *teamModelRateLimitConsoleAdapter) Attempts() []teamModelRateLimitConsoleAttempt {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]teamModelRateLimitConsoleAttempt(nil), a.attempts...)
+}
+
 type systemicForbiddenAdapter struct {
 	mu       sync.Mutex
 	attempts []uint64
@@ -849,6 +1094,7 @@ type systemicForbiddenAdapter struct {
 type authRescueAdapter struct {
 	attempts  atomic.Int64
 	refreshes atomic.Int64
+	rejectAll atomic.Bool
 }
 
 func (a *authRescueAdapter) Provider() account.Provider { return account.ProviderBuild }
@@ -857,6 +1103,12 @@ func (a *authRescueAdapter) Definition() provider.Definition {
 }
 func (a *authRescueAdapter) ForwardResponse(_ context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
 	a.attempts.Add(1)
+	if a.rejectAll.Load() {
+		return &provider.Response{
+			StatusCode: http.StatusUnauthorized, Status: "401 Unauthorized", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"error":{"code":"unauthorized","message":"access token rejected"}}`)),
+		}, nil
+	}
 	if request.Credential.EncryptedAccessToken == "access-old" {
 		return &provider.Response{
 			StatusCode: http.StatusForbidden, Status: "403 Forbidden", Header: make(http.Header),
@@ -902,6 +1154,29 @@ type webImageStreamAdapter struct {
 
 type webChatQuotaAdapter struct {
 	synced chan string
+}
+
+type credentialFailureImageAdapter struct {
+	generationCalls atomic.Int64
+}
+
+func (a *credentialFailureImageAdapter) Provider() account.Provider { return account.ProviderBuild }
+
+func (a *credentialFailureImageAdapter) Definition() provider.Definition {
+	return provider.Definition{
+		Provider: account.ProviderBuild, ModelNamespace: account.ProviderBuild.ModelNamespace(),
+		Credential: provider.CredentialSurface{AuthType: account.AuthTypeOAuth, Refresh: true},
+		Media:      provider.MediaSurface{ImageGeneration: true},
+	}
+}
+
+func (a *credentialFailureImageAdapter) RefreshCredential(context.Context, account.Credential) (provider.RefreshedCredential, error) {
+	return provider.RefreshedCredential{}, errors.New("simulated credential refresh failure")
+}
+
+func (a *credentialFailureImageAdapter) GenerateImage(context.Context, provider.ImageGenerationRequest) (*provider.Response, error) {
+	a.generationCalls.Add(1)
+	return nil, errors.New("unexpected image generation")
 }
 
 func (webRateLimitAdapter) Provider() account.Provider { return account.ProviderWeb }

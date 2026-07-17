@@ -27,12 +27,12 @@ func (adminSessionModel) TableName() string { return "admin_sessions" }
 type accountModel struct {
 	ID               uint64  `gorm:"primaryKey;autoIncrement"`
 	IdentityKey      string  `gorm:"size:64;uniqueIndex;not null;check:chk_accounts_identity_key,length(identity_key) = 64"`
-	Provider         string  `gorm:"size:32;not null;check:chk_accounts_provider,provider IN ('grok_build','grok_web','grok_console')"`
+	Provider         string  `gorm:"size:32;not null;check:chk_accounts_provider,provider IN ('grok_build','grok_web','grok_console');index:idx_accounts_provider_source,priority:1"`
 	Name             string  `gorm:"size:160;not null;check:chk_accounts_name,length(trim(name)) BETWEEN 1 AND 160"`
 	Email            string  `gorm:"size:255;check:chk_accounts_email,length(email) <= 255"`
 	UserID           string  `gorm:"size:255;check:chk_accounts_user_id,length(user_id) <= 255"`
 	TeamID           string  `gorm:"size:255;check:chk_accounts_team_id,length(team_id) <= 255"`
-	SourceKey        string  `gorm:"size:512;not null;check:chk_accounts_source_key,length(trim(source_key)) BETWEEN 1 AND 512"`
+	SourceKey        string  `gorm:"size:512;not null;check:chk_accounts_source_key,length(trim(source_key)) BETWEEN 1 AND 512;index:idx_accounts_provider_source,priority:2"`
 	Enabled          bool    `gorm:"not null"`
 	AuthStatus       string  `gorm:"size:32;not null;check:chk_accounts_auth_status,auth_status IN ('active','reauthRequired')"`
 	Priority         int     `gorm:"not null;default:1"`
@@ -53,18 +53,20 @@ type accountModel struct {
 func (accountModel) TableName() string { return "provider_accounts" }
 
 type accountCredentialModel struct {
-	AccountID        uint64 `gorm:"primaryKey"`
-	AuthType         string `gorm:"size:16;not null;check:chk_account_credentials_auth_type,auth_type IN ('oauth','sso')"`
-	ClientID         string `gorm:"size:255;check:chk_account_credentials_client_id,length(client_id) <= 255"`
-	EncryptedPrimary string `gorm:"type:text;not null;default:'';check:chk_account_credentials_secret,((auth_type = 'oauth' AND (encrypted_primary <> '' OR encrypted_refresh <> '')) OR (auth_type = 'sso' AND encrypted_primary <> '' AND encrypted_refresh = '')) AND length(encrypted_primary) <= 65536 AND length(encrypted_refresh) <= 65536"`
-	EncryptedRefresh string `gorm:"type:text;not null;default:''"`
-	ExpiresAt        *time.Time
-	RefreshDueAt     *time.Time
-	LastRefreshAt    *time.Time
-	RefreshFailures  int           `gorm:"not null;default:0;check:chk_account_credentials_refresh_failures,refresh_failures >= 0"`
-	LastRefreshError string        `gorm:"size:100;not null;default:'';check:chk_account_credentials_refresh_error,length(last_refresh_error) <= 100"`
-	UpdatedAt        time.Time     `gorm:"not null"`
-	Account          *accountModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	AccountID                 uint64 `gorm:"primaryKey"`
+	AuthType                  string `gorm:"size:16;not null;check:chk_account_credentials_auth_type,auth_type IN ('oauth','sso')"`
+	ClientID                  string `gorm:"size:255;check:chk_account_credentials_client_id,length(client_id) <= 255"`
+	EncryptedPrimary          string `gorm:"type:text;not null;default:'';check:chk_account_credentials_secret,((auth_type = 'oauth' AND (encrypted_primary <> '' OR encrypted_refresh <> '')) OR (auth_type = 'sso' AND encrypted_primary <> '' AND encrypted_refresh = '')) AND length(encrypted_primary) <= 65536 AND length(encrypted_refresh) <= 65536"`
+	EncryptedRefresh          string `gorm:"type:text;not null;default:''"`
+	EncryptedCloudflareCookie string `gorm:"type:text;not null;default:'';check:chk_account_credentials_cf_cookie,length(encrypted_cloudflare_cookie) <= 65536"`
+	ExpiresAt                 *time.Time
+	RefreshDueAt              *time.Time
+	LastRefreshAt             *time.Time
+	RefreshFailures           int           `gorm:"not null;default:0;check:chk_account_credentials_refresh_failures,refresh_failures >= 0"`
+	LastRefreshError          string        `gorm:"size:100;not null;default:'';check:chk_account_credentials_refresh_error,length(last_refresh_error) <= 100"`
+	RefreshPermanent          bool          `gorm:"not null;default:false"`
+	UpdatedAt                 time.Time     `gorm:"not null"`
+	Account                   *accountModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 }
 
 func (accountCredentialModel) TableName() string { return "account_credentials" }
@@ -106,16 +108,17 @@ type quotaWindowModel struct {
 func (quotaWindowModel) TableName() string { return "account_quota_windows" }
 
 type billingModel struct {
-	AccountID            uint64        `gorm:"primaryKey"`
-	PlanCode             string        `gorm:"size:100;check:chk_billing_plan_code,length(plan_code) <= 100"`
-	PlanName             string        `gorm:"size:160;check:chk_billing_plan_name,length(plan_name) <= 160"`
-	MonthlyLimit         float64       `gorm:"not null;default:0;check:chk_billing_monthly_limit,monthly_limit >= 0"`
-	Used                 float64       `gorm:"not null;default:0;check:chk_billing_used,used >= 0"`
-	OnDemandCap          float64       `gorm:"not null;default:0;check:chk_billing_on_demand_cap,on_demand_cap >= 0"`
-	OnDemandUsed         float64       `gorm:"not null;default:0;check:chk_billing_on_demand_used,on_demand_used >= 0"`
-	PrepaidBalance       float64       `gorm:"not null;default:0;check:chk_billing_prepaid_balance,prepaid_balance >= 0"`
-	CreditUsagePercent   float64       `gorm:"not null;default:0;check:chk_billing_credit_usage_percent,credit_usage_percent >= 0"`
-	IsUnifiedBillingUser bool          `gorm:"not null;default:false"`
+	AccountID            uint64  `gorm:"primaryKey"`
+	PlanCode             string  `gorm:"size:100;check:chk_billing_plan_code,length(plan_code) <= 100"`
+	PlanName             string  `gorm:"size:160;check:chk_billing_plan_name,length(plan_name) <= 160"`
+	MonthlyLimit         float64 `gorm:"not null;default:0;check:chk_billing_monthly_limit,monthly_limit >= 0"`
+	Used                 float64 `gorm:"not null;default:0;check:chk_billing_used,used >= 0"`
+	OnDemandCap          float64 `gorm:"not null;default:0;check:chk_billing_on_demand_cap,on_demand_cap >= 0"`
+	OnDemandUsed         float64 `gorm:"not null;default:0;check:chk_billing_on_demand_used,on_demand_used >= 0"`
+	PrepaidBalance       float64 `gorm:"not null;default:0;check:chk_billing_prepaid_balance,prepaid_balance >= 0"`
+	CreditUsagePercent   float64 `gorm:"not null;default:0;check:chk_billing_credit_usage_percent,credit_usage_percent >= 0"`
+	IsUnifiedBillingUser bool    `gorm:"not null;default:false"`
+	OnDemandEnabled      *bool
 	TopUpMethod          string        `gorm:"size:100;check:chk_billing_top_up_method,length(top_up_method) <= 100"`
 	UsagePeriodType      string        `gorm:"size:100;check:chk_billing_usage_period_type,length(usage_period_type) <= 100"`
 	UsagePeriodStart     string        `gorm:"size:64;check:chk_billing_usage_period_start,length(usage_period_start) <= 64"`

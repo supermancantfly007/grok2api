@@ -44,7 +44,7 @@ import {
   listAccounts,
   pollDeviceAuthorization,
   refreshAccountBilling,
-  refreshAccountsBilling,
+  refreshAccountsQuota,
   refreshAccountToken,
   refreshAccountQuota,
   refreshAllAccountBilling,
@@ -60,6 +60,7 @@ import {
   type AccountUpdateInput,
   type AccountTaskProgressDTO,
   type BuildConversionInput,
+  type BuildConversionStrategy,
   type WebConsoleSyncInput,
   type DeviceSessionDTO,
   type QuotaDTO,
@@ -79,7 +80,7 @@ export function AccountsPage() {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const syncAbortRef = useRef<AbortController | null>(null);
+  const quotaSyncAbortRef = useRef<AbortController | null>(null);
   const renewalAbortRef = useRef<AbortController | null>(null);
   const conversionAbortRef = useRef<AbortController | null>(null);
   const webConsoleSyncAbortRef = useRef<AbortController | null>(null);
@@ -97,10 +98,12 @@ export function AccountsPage() {
   const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [syncAllOpen, setSyncAllOpen] = useState(false);
-  const [syncProgress, setSyncProgress] = useState<AccountTaskProgressDTO | null>(null);
+  const [quotaSyncProgress, setQuotaSyncProgress] = useState<AccountTaskProgressDTO | null>(null);
   const [conversionTargets, setConversionTargets] = useState<string[] | "all" | null>(null);
+  const [conversionStrategy, setConversionStrategy] = useState<BuildConversionStrategy>("missing");
   const [conversionProgress, setConversionProgress] = useState<BuildConversionProgressState | null>(null);
   const [webConsoleSyncTargets, setWebConsoleSyncTargets] = useState<string[] | "all" | null>(null);
+  const [webConsoleSyncStrategy, setWebConsoleSyncStrategy] = useState<"missing" | "all">("missing");
   const [webConsoleSyncProgress, setWebConsoleSyncProgress] = useState<AccountTaskProgressDTO | null>(null);
   const [renewAllOpen, setRenewAllOpen] = useState(false);
   const [renewalProgress, setRenewalProgress] = useState<AccountTaskProgressDTO | null>(null);
@@ -114,7 +117,7 @@ export function AccountsPage() {
   const debouncedSearch = useDebouncedValue(search);
 
   useEffect(() => () => {
-    syncAbortRef.current?.abort();
+    quotaSyncAbortRef.current?.abort();
     renewalAbortRef.current?.abort();
     conversionAbortRef.current?.abort();
     webConsoleSyncAbortRef.current?.abort();
@@ -128,13 +131,16 @@ export function AccountsPage() {
     priority: z.number().int(),
     maxConcurrent: z.number().int().min(1, t("errors.positive")).max(256),
     minimumRemaining: z.number().min(0),
+    cloudflareCookies: z.string().max(16 << 10, t("settings.invalidValue")),
+    clearCloudflareCookies: z.boolean(),
   });
   type AccountForm = z.infer<typeof accountSchema>;
   const form = useForm<AccountForm>({
     resolver: zodResolver(accountSchema),
-    defaultValues: { name: "", enabled: true, priority: 1, maxConcurrent: 8, minimumRemaining: 0 },
+    defaultValues: { name: "", enabled: true, priority: 1, maxConcurrent: 8, minimumRemaining: 0, cloudflareCookies: "", clearCloudflareCookies: false },
   });
   const accountEnabled = useWatch({ control: form.control, name: "enabled" });
+  const clearCloudflareCookies = useWatch({ control: form.control, name: "clearCloudflareCookies" });
 
   const accountsQuery = useQuery({
     queryKey: ["accounts", provider, page, pageSize, debouncedSearch, typeFilter, statusFilter, renewalFilter, sort.field, sort.order],
@@ -154,7 +160,18 @@ export function AccountsPage() {
   const updateMutation = useMutation({
     mutationFn: (values: AccountForm) => {
       if (!editing) throw new Error(t("errors.generic"));
-      return updateAccount(editing.id, values satisfies AccountUpdateInput);
+      const input: AccountUpdateInput = {
+        name: values.name,
+        enabled: values.enabled,
+        priority: values.priority,
+        maxConcurrent: values.maxConcurrent,
+        minimumRemaining: values.minimumRemaining,
+      };
+      if (editing.provider !== "grok_build") {
+        if (values.clearCloudflareCookies) input.clearCloudflareCookies = true;
+        else if (values.cloudflareCookies.trim()) input.cloudflareCookies = values.cloudflareCookies;
+      }
+      return updateAccount(editing.id, input);
     },
     onSuccess: () => {
       invalidateAccountData();
@@ -201,21 +218,6 @@ export function AccountsPage() {
     onError: showError,
   });
 
-  const allBillingMutation = useMutation({
-    mutationFn: () => {
-      const controller = new AbortController();
-      syncAbortRef.current = controller;
-      setSyncProgress(null);
-      return refreshAllAccountBilling(setSyncProgress, controller.signal);
-    },
-    onSuccess: (result) => {
-      setSyncAllOpen(false);
-      toast.success(t("accounts.allBillingRefreshed", result));
-    },
-    onError: (error) => { if (!isAbortError(error)) showError(error); },
-    onSettled: () => { syncAbortRef.current = null; setSyncProgress(null); invalidateAccountData(); },
-  });
-
   const allTokenMutation = useMutation({
     mutationFn: () => {
       const controller = new AbortController();
@@ -231,40 +233,27 @@ export function AccountsPage() {
     onSettled: () => { renewalAbortRef.current = null; setRenewalProgress(null); invalidateAccountData(); },
   });
 
-  const allWebQuotaMutation = useMutation({
-    mutationFn: () => {
+  const quotaSyncMutation = useMutation({
+    mutationFn: (targetProvider: AccountProvider) => {
       const controller = new AbortController();
-      syncAbortRef.current = controller;
-      setSyncProgress(null);
-      return refreshAllWebAccountQuotas(setSyncProgress, controller.signal);
+      quotaSyncAbortRef.current = controller;
+      setQuotaSyncProgress(null);
+      if (targetProvider === "grok_web") return refreshAllWebAccountQuotas(setQuotaSyncProgress, controller.signal);
+      if (targetProvider === "grok_console") return refreshAllConsoleAccountQuotas(setQuotaSyncProgress, controller.signal);
+      return refreshAllAccountBilling(setQuotaSyncProgress, controller.signal);
     },
     onSuccess: (result) => {
       setSyncAllOpen(false);
       toast.success(t("accounts.allBillingRefreshed", result));
     },
     onError: (error) => { if (!isAbortError(error)) showError(error); },
-    onSettled: () => { syncAbortRef.current = null; setSyncProgress(null); invalidateAccountData(); },
-  });
-
-  const allConsoleQuotaMutation = useMutation({
-    mutationFn: () => {
-      const controller = new AbortController();
-      syncAbortRef.current = controller;
-      setSyncProgress(null);
-      return refreshAllConsoleAccountQuotas(setSyncProgress, controller.signal);
-    },
-    onSuccess: (result) => {
-      setSyncAllOpen(false);
-      toast.success(t("accounts.allBillingRefreshed", result));
-    },
-    onError: (error) => { if (!isAbortError(error)) showError(error); },
-    onSettled: () => { syncAbortRef.current = null; setSyncProgress(null); invalidateAccountData(); },
+    onSettled: () => { quotaSyncAbortRef.current = null; setQuotaSyncProgress(null); invalidateAccountData(); },
   });
   const conversionMutation = useMutation({
     mutationFn: (input: BuildConversionInput) => {
       const controller = new AbortController();
       conversionAbortRef.current = controller;
-      setConversionProgress(Array.isArray(conversionTargets) ? { converting: { completed: 0, total: conversionTargets.length, phase: "converting" } } : null);
+      setConversionProgress(null);
       return convertWebAccountsToBuild(input, (progress) => {
         const phase = progress.phase === "syncing" ? "syncing" : "converting";
         setConversionProgress((current) => ({ ...(current ?? {}), [phase]: progress }));
@@ -364,7 +353,7 @@ export function AccountsPage() {
   });
 
   const batchBillingMutation = useMutation({
-    mutationFn: () => refreshAccountsBilling([...selected], provider),
+    mutationFn: () => refreshAccountsQuota([...selected], provider),
     onSuccess: (result) => {
       setSelected(new Set());
       invalidateAccountData();
@@ -443,6 +432,16 @@ export function AccountsPage() {
     importMutation.mutate([new File([value], filename, { type: "text/plain" })]);
   }
 
+  function openWebConsoleSync(targets: string[] | "all"): void {
+    setWebConsoleSyncStrategy("missing");
+    setWebConsoleSyncTargets(targets);
+  }
+
+  function openBuildConversion(targets: string[] | "all"): void {
+    setConversionStrategy("missing");
+    setConversionTargets(targets);
+  }
+
   async function startDeviceLogin(): Promise<void> {
     setDeviceOpen(true);
     setDeviceStatus("starting");
@@ -465,6 +464,8 @@ export function AccountsPage() {
       priority: account.priority,
       maxConcurrent: account.maxConcurrent,
       minimumRemaining: account.minimumRemaining,
+      cloudflareCookies: "",
+      clearCloudflareCookies: false,
     });
   }
 
@@ -519,7 +520,14 @@ export function AccountsPage() {
   const summaryUnavailable = summaryQuery.isError;
   const providerAccountTotal = provider === "grok_build" ? buildSummary.total : provider === "grok_web" ? webSummary.total : consoleSummary.total;
   const hasProviderAccounts = providerAccountTotal > 0 || (result?.total ?? 0) > 0;
-  const syncAllPending = allBillingMutation.isPending || allWebQuotaMutation.isPending || allConsoleQuotaMutation.isPending;
+  const bulkTaskPending = quotaSyncMutation.isPending
+    || allTokenMutation.isPending
+    || conversionMutation.isPending
+    || webConsoleSyncMutation.isPending
+    || importMutation.isPending
+    || batchUpdateMutation.isPending
+    || batchBillingMutation.isPending
+    || batchDeleteMutation.isPending;
 
   return (
     <div className="space-y-8">
@@ -565,15 +573,15 @@ export function AccountsPage() {
                 <Input className="h-8 pl-9 text-xs" value={search} onChange={(event) => { setSearch(event.target.value); setPage(1); }} placeholder={t("accounts.search")} aria-label={t("accounts.search")} />
               </div>
               <DataTableFilters filters={[
-                ...(provider === "grok_console" ? [] : [{ id: "type", label: t("accounts.type"), value: typeFilter, onChange: (value: string) => { setTypeFilter(value); setPage(1); }, options: provider === "grok_web" ? [
-                  { value: "auto", label: "Auto" },
-                  { value: "basic", label: "Basic" },
-                  { value: "super", label: "Super" },
-                  { value: "heavy", label: "Heavy" },
+                ...(provider === "grok_console" ? [] : [{ id: "type", label: t("accountType.label"), value: typeFilter, onChange: (value: string) => { setTypeFilter(value); setPage(1); }, options: provider === "grok_web" ? [
+                  { value: "auto", label: t("accountType.auto") },
+                  { value: "basic", label: t("accountType.free") },
+                  { value: "super", label: t("accountType.super") },
+                  { value: "heavy", label: t("accountType.heavy") },
                 ] : [
-                  { value: "free", label: t("accounts.quotaFree") },
-                  { value: "paid", label: t("accounts.quotaSuper") },
-                  { value: "unknown", label: t("dashboard.unknown") },
+                  { value: "free", label: t("accountType.free") },
+                  { value: "paid", label: t("accountType.paid") },
+                  { value: "unknown", label: t("accountType.pending") },
                 ] }]),
                 { id: "status", label: t("accounts.status"), value: statusFilter, onChange: (value) => { setStatusFilter(value); setPage(1); }, options: [
                   { value: "active", label: t("accounts.statusActive") },
@@ -592,25 +600,25 @@ export function AccountsPage() {
             {selected.size > 0 ? (
               <div className="flex flex-wrap items-center gap-1.5">
                 <span className="mr-1 text-xs text-muted-foreground">{t("common.selectedCount", { count: selected.size })}</span>
-                <Button variant="secondary" size="sm" onClick={() => batchUpdateMutation.mutate(true)}>{t("common.enable")}</Button>
-                <Button variant="secondary" size="sm" onClick={() => batchUpdateMutation.mutate(false)}>{t("common.disable")}</Button>
-                {provider === "grok_web" ? <Button variant="secondary" size="sm" onClick={() => setConversionTargets([...selected])}>{t("accounts.convertToBuild")}</Button> : null}
-                {provider === "grok_web" ? <Button variant="secondary" size="sm" onClick={() => setWebConsoleSyncTargets([...selected])}>{t("webConsoleSync.action")}</Button> : null}
-                {provider === "grok_build" ? <Button variant="secondary" size="sm" onClick={() => batchBillingMutation.mutate()}>{t("accounts.refreshBilling")}</Button> : null}
-                <Button variant="ghost" size="sm" className="text-destructive hover:text-destructive" onClick={() => setBatchDeleteOpen(true)}>{t("common.delete")}</Button>
+                <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchUpdateMutation.mutate(true)}>{t("common.enable")}</Button>
+                <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchUpdateMutation.mutate(false)}>{t("common.disable")}</Button>
+                {provider === "grok_web" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openBuildConversion([...selected])}>{t("accounts.convertToBuild")}</Button> : null}
+                {provider === "grok_web" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openWebConsoleSync([...selected])}>{t("webConsoleSync.action")}</Button> : null}
+                <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchBillingMutation.mutate()}>{t("accountCredential.quotaSyncAction")}</Button>
+                <Button variant="ghost" size="sm" className="text-destructive hover:text-destructive" disabled={bulkTaskPending} onClick={() => setBatchDeleteOpen(true)}>{t("common.delete")}</Button>
               </div>
             ) : (
               <div className="flex items-center gap-1.5">
-                {provider === "grok_web" && webSummary.total > 0 ? <Button variant="secondary" size="sm" onClick={() => setConversionTargets("all")}>{t("accountBulk.convertAllToBuild")}</Button> : null}
-                {provider === "grok_web" && webSummary.total > 0 ? <Button variant="secondary" size="sm" onClick={() => setWebConsoleSyncTargets("all")}>{t("webConsoleSync.allAction")}</Button> : null}
-                {hasProviderAccounts ? <Button variant="secondary" size="sm" onClick={() => setSyncAllOpen(true)}>{t("accountCredential.quotaSyncAction")}</Button> : null}
-                {hasProviderAccounts && provider === "grok_build" ? <Button variant="secondary" size="sm" onClick={() => setRenewAllOpen(true)}>{t("accountCredential.refreshAction")}</Button> : null}
+                {provider === "grok_web" && webSummary.total > 0 ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openBuildConversion("all")}>{t("accountBulk.convertAllToBuild")}</Button> : null}
+                {provider === "grok_web" && webSummary.total > 0 ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openWebConsoleSync("all")}>{t("webConsoleSync.allAction")}</Button> : null}
+                {hasProviderAccounts ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setSyncAllOpen(true)}>{t("accountCredential.quotaSyncAction")}</Button> : null}
+                {hasProviderAccounts && provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setRenewAllOpen(true)}>{t("accountCredential.refreshAction")}</Button> : null}
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild><Button size="sm">{t("accounts.connectAccount")}</Button></DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
                     {provider === "grok_build" ? <DropdownMenuItem onClick={() => void startDeviceLogin()}><ExternalLink />{t("accounts.deviceLogin")}</DropdownMenuItem> : null}
-                    {provider !== "grok_build" ? <DropdownMenuItem disabled={importMutation.isPending} onClick={() => setQuickImportOpen(true)}><ClipboardPaste />{t("accounts.quickImportSSO")}</DropdownMenuItem> : null}
-                    <DropdownMenuItem disabled={importMutation.isPending} onClick={() => fileInputRef.current?.click()}><FileUp />{provider === "grok_build" ? t("accounts.importAuth") : provider === "grok_console" ? t("console.importFile") : t("accounts.importWebFile")}</DropdownMenuItem>
+                    {provider !== "grok_build" ? <DropdownMenuItem disabled={bulkTaskPending} onClick={() => setQuickImportOpen(true)}><ClipboardPaste />{t("accounts.quickImportSSO")}</DropdownMenuItem> : null}
+                    <DropdownMenuItem disabled={bulkTaskPending} onClick={() => fileInputRef.current?.click()}><FileUp />{provider === "grok_build" ? t("accounts.importAuth") : provider === "grok_console" ? t("console.importFile") : t("accounts.importWebFile")}</DropdownMenuItem>
                     {hasProviderAccounts && provider === "grok_build" ? (
                       <>
                         <DropdownMenuSeparator />
@@ -643,7 +651,7 @@ export function AccountsPage() {
               <TableRow className="hover:bg-transparent">
                 <TableHead className="px-2"><Checkbox checked={allPageSelected ? true : selectedOnPage.length > 0 ? "indeterminate" : false} onCheckedChange={(checked) => togglePage(checked === true)} aria-label={t("common.selectPage")} /></TableHead>
                 <SortableTableHead field="name" sortBy={sort.field} sortOrder={sort.order} onSort={changeSort}>{t("accounts.account")}</SortableTableHead>
-                <SortableTableHead field="type" sortBy={sort.field} sortOrder={sort.order} align="center" onSort={changeSort} className="whitespace-nowrap">{t("accounts.type")}</SortableTableHead>
+                <SortableTableHead field="type" sortBy={sort.field} sortOrder={sort.order} align="center" onSort={changeSort} className="whitespace-nowrap">{t("accountType.label")}</SortableTableHead>
                 <SortableTableHead field="status" sortBy={sort.field} sortOrder={sort.order} align="center" onSort={changeSort} className="whitespace-nowrap">{t("accounts.status")}</SortableTableHead>
                 <TableHead className="whitespace-nowrap">{t("accounts.quota")}</TableHead>
                 {provider === "grok_build" ? <TableHead className="whitespace-nowrap pl-4">{t("accountCredential.label")}</TableHead> : null}
@@ -679,7 +687,7 @@ export function AccountsPage() {
                         </div>
                       ) : null}
                     </TableCell>
-                    <TableCell className="text-center whitespace-nowrap">{provider === "grok_web" ? <WebAccountType tier={account.webTier} /> : provider === "grok_console" ? <AccountTypeText label={t("console.type")} variant="free" /> : <AccountType quota={account.quota} />}</TableCell>
+                    <TableCell className="text-center whitespace-nowrap">{provider === "grok_web" ? <WebAccountType tier={account.webTier} /> : provider === "grok_console" ? <AccountTypeText label={t("accountType.console")} variant="free" /> : <AccountType quota={account.quota} />}</TableCell>
                     <TableCell className="text-center whitespace-nowrap"><AccountStatus account={account} /></TableCell>
                     <TableCell>{provider === "grok_web" ? <WebQuota windows={account.quotaWindows ?? []} locale={i18n.language} tier={account.webTier} /> : provider === "grok_console" ? <ConsoleQuota windows={account.quotaWindows ?? []} locale={i18n.language} /> : <AccountQuota quota={account.quota} billing={account.billing} locale={i18n.language} />}</TableCell>
                     {provider === "grok_build" ? <TableCell className="whitespace-nowrap pl-4 text-xs">
@@ -696,8 +704,8 @@ export function AccountsPage() {
                         <DropdownMenuTrigger asChild><Button variant="ghost" size="icon" className="size-8" aria-label={t("common.actions")}><MoreHorizontal /></Button></DropdownMenuTrigger>
                         <DropdownMenuContent align="end">
                           <DropdownMenuItem onClick={() => beginEdit(account)}><Pencil />{t("common.edit")}</DropdownMenuItem>
-                          {provider === "grok_web" && !account.linkedAccountId ? <DropdownMenuItem onClick={() => setConversionTargets([account.id])}><ArrowRight />{t("accounts.convertToBuild")}</DropdownMenuItem> : null}
-                          {provider === "grok_web" ? <DropdownMenuItem onClick={() => setWebConsoleSyncTargets([account.id])}><ArrowRight />{t("webConsoleSync.action")}</DropdownMenuItem> : null}
+                          {provider === "grok_web" ? <DropdownMenuItem onClick={() => openBuildConversion([account.id])}><ArrowRight />{t("accounts.convertToBuild")}</DropdownMenuItem> : null}
+                          {provider === "grok_web" ? <DropdownMenuItem onClick={() => openWebConsoleSync([account.id])}><ArrowRight />{t("webConsoleSync.action")}</DropdownMenuItem> : null}
                           {provider === "grok_build" ? <DropdownMenuItem onClick={() => tokenMutation.mutate(account.id)}><RotateCw />{t("accounts.refreshToken")}</DropdownMenuItem> : null}
                           <DropdownMenuItem onClick={() => provider === "grok_build" ? billingMutation.mutate(account.id) : quotaMutation.mutate(account.id)}><RefreshCw />{provider === "grok_build" ? t("accounts.refreshBilling") : t("accounts.refreshModeQuota")}</DropdownMenuItem>
                           <DropdownMenuSeparator />
@@ -714,10 +722,10 @@ export function AccountsPage() {
         </DataTableShell>
       </div>
 
-      <AlertDialog open={syncAllOpen} onOpenChange={(open) => { if (!open) syncAbortRef.current?.abort(); setSyncAllOpen(open); }}>
+      <AlertDialog open={syncAllOpen} onOpenChange={(open) => { if (!open) quotaSyncAbortRef.current?.abort(); setSyncAllOpen(open); }}>
         <AlertDialogContent>
           <AlertDialogHeader><AlertDialogTitle>{t("accounts.syncAllTitle")}</AlertDialogTitle><AlertDialogDescription>{t(provider === "grok_web" ? "accounts.syncAllWebDescription" : provider === "grok_console" ? "console.syncAllDescription" : "accounts.syncAllDescription")}</AlertDialogDescription></AlertDialogHeader>
-          <AlertDialogFooter><AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel><AlertDialogAction disabled={syncAllPending} onClick={() => provider === "grok_web" ? allWebQuotaMutation.mutate() : provider === "grok_console" ? allConsoleQuotaMutation.mutate() : allBillingMutation.mutate()}>{syncAllPending ? <><Spinner />{syncProgress ? <span className="tabular-nums">{syncProgress.completed} / {syncProgress.total}</span> : t("common.loading")}</> : t("accounts.syncAll")}</AlertDialogAction></AlertDialogFooter>
+          <AlertDialogFooter><AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel><AlertDialogAction disabled={quotaSyncMutation.isPending} onClick={() => quotaSyncMutation.mutate(provider)}>{quotaSyncMutation.isPending ? <><Spinner />{quotaSyncProgress ? <span className="tabular-nums">{quotaSyncProgress.completed} / {quotaSyncProgress.total}</span> : t("common.loading")}</> : t("accounts.syncAll")}</AlertDialogAction></AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
 
@@ -725,12 +733,20 @@ export function AccountsPage() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t(webConsoleSyncTargets === "all" ? "webConsoleSync.allTitle" : "webConsoleSync.selectedTitle")}</AlertDialogTitle>
-            <AlertDialogDescription>{webConsoleSyncTargets === "all" ? t("webConsoleSync.allDescription") : t("webConsoleSync.selectedDescription", { count: webConsoleSyncTargets?.length ?? 0 })}</AlertDialogDescription>
+            <AlertDialogDescription>{t(webConsoleSyncTargets === "all" ? "webConsoleSync.allDescription" : "webConsoleSync.selectedDescription")}</AlertDialogDescription>
           </AlertDialogHeader>
+          <div className="space-y-2">
+            <p id="web-console-sync-strategy" className="text-xs font-medium">{t("webConsoleSync.strategyTitle")}</p>
+            <div role="radiogroup" aria-labelledby="web-console-sync-strategy" className="grid grid-cols-2 rounded-md bg-muted p-1">
+              <Button type="button" role="radio" aria-checked={webConsoleSyncStrategy === "missing"} variant={webConsoleSyncStrategy === "missing" ? "secondary" : "ghost"} size="sm" className="h-8 rounded-sm px-3 text-xs font-normal shadow-none" onClick={() => setWebConsoleSyncStrategy("missing")}>{t("webConsoleSync.missingStrategy")}</Button>
+              <Button type="button" role="radio" aria-checked={webConsoleSyncStrategy === "all"} variant={webConsoleSyncStrategy === "all" ? "secondary" : "ghost"} size="sm" className="h-8 rounded-sm px-3 text-xs font-normal shadow-none" onClick={() => setWebConsoleSyncStrategy("all")}>{t("webConsoleSync.allStrategy")}</Button>
+            </div>
+            <p className="min-h-8 text-xs text-muted-foreground">{t(webConsoleSyncStrategy === "missing" ? "webConsoleSync.missingStrategyDescription" : "webConsoleSync.allStrategyDescription")}</p>
+          </div>
           <AlertDialogFooter>
             <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
-            <AlertDialogAction disabled={webConsoleSyncMutation.isPending || webConsoleSyncTargets === null || (Array.isArray(webConsoleSyncTargets) && webConsoleSyncTargets.length === 0)} onClick={(event) => { event.preventDefault(); if (webConsoleSyncTargets === "all") webConsoleSyncMutation.mutate({ all: true }); else if (webConsoleSyncTargets) webConsoleSyncMutation.mutate({ ids: webConsoleSyncTargets }); }}>
-              {webConsoleSyncMutation.isPending ? <><Spinner />{webConsoleSyncProgress ? <span className="tabular-nums">{webConsoleSyncProgress.completed} / {webConsoleSyncProgress.total}</span> : t("common.loading")}</> : t(webConsoleSyncTargets === "all" ? "webConsoleSync.allAction" : "webConsoleSync.action")}
+            <AlertDialogAction disabled={webConsoleSyncMutation.isPending || webConsoleSyncTargets === null || (Array.isArray(webConsoleSyncTargets) && webConsoleSyncTargets.length === 0)} onClick={(event) => { event.preventDefault(); if (webConsoleSyncTargets === "all") webConsoleSyncMutation.mutate({ all: true, strategy: webConsoleSyncStrategy }); else if (webConsoleSyncTargets) webConsoleSyncMutation.mutate({ ids: webConsoleSyncTargets, strategy: webConsoleSyncStrategy }); }}>
+              {webConsoleSyncMutation.isPending ? <><Spinner />{webConsoleSyncProgress ? <span className="tabular-nums">{webConsoleSyncProgress.completed} / {webConsoleSyncProgress.total}</span> : t("common.loading")}</> : t(webConsoleSyncStrategy === "missing" ? "webConsoleSync.syncMissing" : "webConsoleSync.syncAll")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -740,12 +756,20 @@ export function AccountsPage() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t(conversionTargets === "all" ? "accountBulk.convertAllToBuildTitle" : "accounts.convertToBuildTitle")}</AlertDialogTitle>
-            <AlertDialogDescription>{conversionTargets === "all" ? t("accountBulk.convertAllToBuildDescription") : t("accounts.convertToBuildDescription", { count: conversionTargets?.length ?? 0 })}</AlertDialogDescription>
+            <AlertDialogDescription>{t(conversionTargets === "all" ? "accountBulk.convertAllToBuildDescription" : "accountBulk.selectedDescription")}</AlertDialogDescription>
           </AlertDialogHeader>
+          <div className="space-y-2">
+            <p id="web-build-conversion-strategy" className="text-xs font-medium">{t("accountBulk.strategyTitle")}</p>
+            <div role="radiogroup" aria-labelledby="web-build-conversion-strategy" className="grid grid-cols-2 rounded-md bg-muted p-1">
+              <Button type="button" role="radio" aria-checked={conversionStrategy === "missing"} variant={conversionStrategy === "missing" ? "secondary" : "ghost"} size="sm" className="h-8 rounded-sm px-3 text-xs font-normal shadow-none" onClick={() => setConversionStrategy("missing")}>{t("accountBulk.missingStrategy")}</Button>
+              <Button type="button" role="radio" aria-checked={conversionStrategy === "all"} variant={conversionStrategy === "all" ? "secondary" : "ghost"} size="sm" className="h-8 rounded-sm px-3 text-xs font-normal shadow-none" onClick={() => setConversionStrategy("all")}>{t("accountBulk.allStrategy")}</Button>
+            </div>
+            <p className="min-h-8 text-xs text-muted-foreground">{t(conversionStrategy === "missing" ? "accountBulk.missingStrategyDescription" : "accountBulk.allStrategyDescription")}</p>
+          </div>
           <AlertDialogFooter>
             <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
-            <AlertDialogAction disabled={conversionMutation.isPending || conversionTargets === null || (Array.isArray(conversionTargets) && conversionTargets.length === 0)} onClick={(event) => { event.preventDefault(); if (conversionTargets === "all") conversionMutation.mutate({ all: true }); else if (conversionTargets) conversionMutation.mutate({ ids: conversionTargets }); }}>
-              {conversionMutation.isPending ? <><Spinner />{activeConversionProgress ? <span className="whitespace-nowrap tabular-nums">{t(activeConversionProgress.phase === "syncing" ? "accounts.syncingProgress" : "accounts.convertingProgress", activeConversionProgress)}</span> : t("common.loading")}</> : t(conversionTargets === "all" ? "accountBulk.convertAllToBuild" : "accounts.convertToBuild")}
+            <AlertDialogAction disabled={conversionMutation.isPending || conversionTargets === null || (Array.isArray(conversionTargets) && conversionTargets.length === 0)} onClick={(event) => { event.preventDefault(); if (conversionTargets === "all") conversionMutation.mutate({ all: true, strategy: conversionStrategy }); else if (conversionTargets) conversionMutation.mutate({ ids: conversionTargets, strategy: conversionStrategy }); }}>
+              {conversionMutation.isPending ? <><Spinner />{activeConversionProgress ? <span className="whitespace-nowrap tabular-nums">{t(activeConversionProgress.phase === "syncing" ? "accounts.syncingProgress" : "accounts.convertingProgress", activeConversionProgress)}</span> : t("common.loading")}</> : t(conversionStrategy === "missing" ? "accountBulk.convertMissing" : "accountBulk.convertAll")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -833,6 +857,27 @@ export function AccountsPage() {
               <div className="space-y-2"><Label htmlFor="account-concurrency">{t("accounts.maxConcurrent")}</Label><Input id="account-concurrency" type="number" min="1" max="256" {...form.register("maxConcurrent", { valueAsNumber: true })} /></div>
             </div>
             <div className="space-y-2"><Label htmlFor="account-minimum">{t("accounts.minimumRemaining")}</Label><Input id="account-minimum" type="number" min="0" step="0.01" {...form.register("minimumRemaining", { valueAsNumber: true })} /></div>
+            {editing && editing.provider !== "grok_build" ? (
+              <div className="space-y-2">
+                <Label htmlFor="account-cloudflare-cookie">{t("settings.egress.cloudflareCookie")}</Label>
+                <Textarea
+                  id="account-cloudflare-cookie"
+                  className="min-h-20 font-mono text-xs"
+                  autoComplete="new-password"
+                  spellCheck={false}
+                  disabled={clearCloudflareCookies}
+                  placeholder={editing?.cloudflareCookieConfigured ? t("settings.egress.keepConfigured") : "cf_clearance=..."}
+                  {...form.register("cloudflareCookies")}
+                />
+                {editing?.cloudflareCookieConfigured ? (
+                  <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <Checkbox checked={clearCloudflareCookies} onCheckedChange={(checked) => form.setValue("clearCloudflareCookies", checked === true)} />
+                    {t("common.clear")}
+                  </label>
+                ) : null}
+                {form.formState.errors.cloudflareCookies ? <p className="text-xs text-destructive">{form.formState.errors.cloudflareCookies.message}</p> : null}
+              </div>
+            ) : null}
             <DialogFooter><Button type="button" variant="secondary" size="sm" onClick={() => setEditing(null)}>{t("common.cancel")}</Button><Button type="submit" size="sm" disabled={updateMutation.isPending}>{updateMutation.isPending ? <Spinner /> : null}{t("common.save")}</Button></DialogFooter>
           </form>
         </DialogContent>
@@ -877,34 +922,28 @@ function AccountMetricPanel({ icon, label, value, detail, loading }: { icon: Rea
   );
 }
 
-function webTierLabel(tier: AccountDTO["webTier"]) {
-  if (tier === "basic") return "Free";
-  if (tier === "super") return "Super";
-  if (tier === "heavy") return "Heavy";
-  return "Auto";
-}
-
 function WebAccountType({ tier }: { tier?: AccountDTO["webTier"] }) {
-  const label = webTierLabel(tier);
+  const { t } = useTranslation();
+  const label = tier === "basic" ? t("accountType.free") : tier === "super" ? t("accountType.super") : tier === "heavy" ? t("accountType.heavy") : t("accountType.auto");
   return <AccountTypeText label={label} variant={tier === "basic" ? "free" : "default"} />;
 }
 
 function AccountType({ quota }: { quota: QuotaDTO }) {
   const { t } = useTranslation();
   if (quota.type === "unknown") {
-    return <AccountTypeText label={t("dashboard.unknown")} variant="muted" />;
+    return <AccountTypeText label={t("accountType.pending")} title={t("accountType.pendingDescription")} variant="muted" />;
   }
 
   const isFree = quota.type === "free";
-  const label = isFree ? t("accounts.quotaFree") : t("accounts.quotaSuper");
+  const label = isFree ? t("accountType.free") : t("accountType.paid");
   return <AccountTypeText label={label} variant={isFree ? "free" : "default"} />;
 }
 
-function AccountTypeText({ label, variant }: { label: string; variant: "default" | "free" | "muted" }) {
+function AccountTypeText({ label, title, variant }: { label: string; title?: string; variant: "default" | "free" | "muted" }) {
   if (variant === "muted") {
-    return <span className="text-xs text-muted-foreground">{label}</span>;
+    return <span title={title ?? label} className="text-xs text-muted-foreground">{label}</span>;
   }
-  return <span title={label} className={cn("max-w-32 truncate text-xs font-medium", variant === "free" ? "text-emerald-700 dark:text-emerald-300" : "text-primary")}>{label}</span>;
+  return <span title={title ?? label} className={cn("max-w-32 truncate text-xs font-medium", variant === "free" ? "text-emerald-700 dark:text-emerald-300" : "text-primary")}>{label}</span>;
 }
 
 function AccountStatus({ account }: { account: AccountDTO }) {
