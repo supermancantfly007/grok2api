@@ -30,6 +30,13 @@ const (
 	ssoApproveURL    = "https://auth.x.ai/oauth2/device/approve"
 	ssoTokenURL      = "https://auth.x.ai/oauth2/token"
 	maxAuthBody      = 2 << 20
+
+	// 对齐 Grok Manager 的批量 SSO 转换鲁棒性；并发仍由 account.conversionPool 控制。
+	ssoBuildMaxRetries         = 6
+	ssoBuildConversionTimeout  = 3 * time.Minute
+	ssoBuildTokenPollCap       = 120 * time.Second
+	ssoBuildBackoffBase        = 10 * time.Second
+	ssoBuildBackoffCap         = 90 * time.Second
 )
 
 type ssoBuildHTTPClient interface {
@@ -40,6 +47,8 @@ type ssoBuildFlow struct {
 	client    ssoBuildHTTPClient
 	userAgent string
 	cookies   map[string]string
+	// sleep 可注入，测试中置为立即返回以避免真实等待。
+	sleep func(context.Context, time.Duration) error
 }
 
 func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
@@ -59,7 +68,7 @@ func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.C
 		return provider.CredentialSeed{}, err
 	}
 	defer lease.Release()
-	requestCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	requestCtx, cancel := context.WithTimeout(ctx, ssoBuildConversionTimeout)
 	defer cancel()
 	flow := &ssoBuildFlow{
 		client: lease, userAgent: lease.UserAgent,
@@ -74,73 +83,107 @@ func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.C
 	return seed, nil
 }
 
+type deviceAuthorization struct {
+	DeviceCode              string
+	UserCode                string
+	VerificationURIComplete string
+	Interval                int
+	ExpiresIn               int
+}
+
 func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
 	status, finalURL, _, err := f.do(ctx, http.MethodGet, ssoAccountsURL, nil)
 	if err != nil {
 		return provider.CredentialSeed{}, err
 	}
-	if status == http.StatusUnauthorized || strings.Contains(finalURL, "sign-in") || strings.Contains(finalURL, "sign-up") {
+	lowURL := strings.ToLower(finalURL)
+	if status == http.StatusUnauthorized || strings.Contains(lowURL, "sign-in") || strings.Contains(lowURL, "sign-up") || strings.Contains(lowURL, "login") {
 		return provider.CredentialSeed{}, provider.ErrUnauthorized
 	}
 	if status < 200 || status >= 400 {
 		return provider.CredentialSeed{}, fmt.Errorf("校验 Grok Web SSO 失败: %w", conversionHTTPError{status: status})
 	}
 
-	form := url.Values{"client_id": {ssoBuildClientID}, "scope": {ssoBuildScope}}
-	status, _, body, err := f.do(ctx, http.MethodPost, ssoDeviceURL, form)
-	if err != nil {
-		return provider.CredentialSeed{}, err
-	}
-	if status < 200 || status >= 300 {
-		return provider.CredentialSeed{}, fmt.Errorf("xAI Device Flow 启动失败: %w", conversionHTTPError{status: status})
-	}
-	var device struct {
-		DeviceCode              string `json:"device_code"`
-		UserCode                string `json:"user_code"`
-		VerificationURIComplete string `json:"verification_uri_complete"`
-		Interval                int    `json:"interval"`
-		ExpiresIn               int    `json:"expires_in"`
-	}
-	if err := json.Unmarshal(body, &device); err != nil {
-		return provider.CredentialSeed{}, fmt.Errorf("解析 xAI Device Flow: %w", err)
-	}
-	if device.DeviceCode == "" || device.UserCode == "" || !safeXAIURL(device.VerificationURIComplete) {
-		return provider.CredentialSeed{}, fmt.Errorf("xAI Device Flow 返回字段不完整")
-	}
-	if device.Interval <= 0 {
-		device.Interval = 5
-	}
-	if device.ExpiresIn <= 0 {
-		device.ExpiresIn = 1800
+	var device deviceAuthorization
+	freshDevice := func() error {
+		next, err := f.requestDevice(ctx)
+		if err != nil {
+			return err
+		}
+		device = next
+		status, _, _, err := f.do(ctx, http.MethodGet, device.VerificationURIComplete, nil)
+		if err != nil {
+			return fmt.Errorf("打开 Device Flow 验证页失败: %w", err)
+		}
+		if status < 200 || status >= 400 {
+			return fmt.Errorf("打开 Device Flow 验证页失败: %w", conversionHTTPError{status: status})
+		}
+		return nil
 	}
 
-	status, finalURL, _, err = f.do(ctx, http.MethodGet, device.VerificationURIComplete, nil)
-	if err != nil {
+	if err := f.requestDeviceWithRetry(ctx, freshDevice); err != nil {
 		return provider.CredentialSeed{}, err
 	}
-	if status < 200 || status >= 400 {
-		return provider.CredentialSeed{}, fmt.Errorf("打开 Device Flow 验证页失败: %w", conversionHTTPError{status: status})
+
+	rateHits := 0
+	approveOK := false
+	for attempt := 1; attempt <= ssoBuildMaxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return provider.CredentialSeed{}, err
+		}
+
+		status, finalURL, body, err := f.do(ctx, http.MethodPost, ssoVerifyURL, url.Values{"user_code": {device.UserCode}})
+		if err != nil {
+			if sleepErr := f.backoff(ctx, attempt); sleepErr != nil {
+				return provider.CredentialSeed{}, sleepErr
+			}
+			continue
+		}
+		if isSSOConversionRateLimited(status, finalURL, string(body)) {
+			rateHits++
+			if sleepErr := f.backoff(ctx, attempt); sleepErr != nil {
+				return provider.CredentialSeed{}, sleepErr
+			}
+			if err := freshDevice(); err != nil {
+				return provider.CredentialSeed{}, err
+			}
+			continue
+		}
+		// 对齐 GM：无 consent 且 status>=400 才硬失败；2xx 即使无 consent 也继续 approve。
+		if status >= 400 && !strings.Contains(strings.ToLower(finalURL+" "+string(body)), "consent") {
+			return provider.CredentialSeed{}, fmt.Errorf("SSO 自动验证 Device Flow 失败: %w", conversionHTTPError{status: status})
+		}
+
+		status, finalURL, body, err = f.do(ctx, http.MethodPost, ssoApproveURL, url.Values{
+			"user_code": {device.UserCode}, "action": {"allow"}, "principal_type": {"User"}, "principal_id": {""},
+		})
+		if err != nil {
+			if sleepErr := f.backoff(ctx, attempt); sleepErr != nil {
+				return provider.CredentialSeed{}, sleepErr
+			}
+			continue
+		}
+		if isSSOConversionRateLimited(status, finalURL, string(body)) {
+			rateHits++
+			if sleepErr := f.backoff(ctx, attempt); sleepErr != nil {
+				return provider.CredentialSeed{}, sleepErr
+			}
+			if err := freshDevice(); err != nil {
+				return provider.CredentialSeed{}, err
+			}
+			continue
+		}
+		// 对齐 GM：status>=400 且 URL 不含 done 才失败；落到 done 即视为批准成功。
+		if status >= 400 && !strings.Contains(strings.ToLower(finalURL), "done") {
+			return provider.CredentialSeed{}, fmt.Errorf("SSO 自动批准 Device Flow 失败: %w", conversionHTTPError{status: status})
+		}
+		approveOK = true
+		break
 	}
-	status, finalURL, _, err = f.do(ctx, http.MethodPost, ssoVerifyURL, url.Values{"user_code": {device.UserCode}})
-	if err != nil {
-		return provider.CredentialSeed{}, err
-	}
-	if status < 200 || status >= 400 {
-		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动验证 Device Flow 失败: %w", conversionHTTPError{status: status})
-	}
-	if !strings.Contains(finalURL, "consent") {
-		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动验证 Device Flow 失败")
-	}
-	status, finalURL, _, err = f.do(ctx, http.MethodPost, ssoApproveURL, url.Values{
-		"user_code": {device.UserCode}, "action": {"allow"}, "principal_type": {"User"}, "principal_id": {""},
-	})
-	if err != nil {
-		return provider.CredentialSeed{}, err
-	}
-	if status < 200 || status >= 400 {
-		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动批准 Device Flow 失败: %w", conversionHTTPError{status: status})
-	}
-	if !strings.Contains(finalURL, "done") {
+	if !approveOK {
+		if rateHits > 0 {
+			return provider.CredentialSeed{}, fmt.Errorf("SSO 自动批准 Device Flow 限流重试耗尽")
+		}
 		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动批准 Device Flow 失败")
 	}
 
@@ -164,6 +207,71 @@ func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Cre
 	}, nil
 }
 
+func (f *ssoBuildFlow) requestDeviceWithRetry(ctx context.Context, freshDevice func() error) error {
+	var lastErr error
+	for attempt := 1; attempt <= ssoBuildMaxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := freshDevice()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetryableSSOConversionError(err) && !errors.Is(err, context.DeadlineExceeded) {
+			// 非限流/瞬时错误：仍允许网络类错误重试。
+			if !isTransientSSOConversionError(err) {
+				return err
+			}
+		}
+		if sleepErr := f.backoff(ctx, attempt); sleepErr != nil {
+			return sleepErr
+		}
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("xAI Device Flow 启动失败")
+}
+
+func (f *ssoBuildFlow) requestDevice(ctx context.Context) (deviceAuthorization, error) {
+	form := url.Values{"client_id": {ssoBuildClientID}, "scope": {ssoBuildScope}}
+	status, _, body, err := f.do(ctx, http.MethodPost, ssoDeviceURL, form)
+	if err != nil {
+		return deviceAuthorization{}, err
+	}
+	if status == http.StatusTooManyRequests || isSSOConversionRateLimited(status, "", string(body)) {
+		return deviceAuthorization{}, fmt.Errorf("xAI Device Flow 启动限流: %w", conversionHTTPError{status: status})
+	}
+	if status < 200 || status >= 300 {
+		return deviceAuthorization{}, fmt.Errorf("xAI Device Flow 启动失败: %w", conversionHTTPError{status: status})
+	}
+	var device struct {
+		DeviceCode              string `json:"device_code"`
+		UserCode                string `json:"user_code"`
+		VerificationURIComplete string `json:"verification_uri_complete"`
+		Interval                int    `json:"interval"`
+		ExpiresIn               int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(body, &device); err != nil {
+		return deviceAuthorization{}, fmt.Errorf("解析 xAI Device Flow: %w", err)
+	}
+	if device.DeviceCode == "" || device.UserCode == "" || !safeXAIURL(device.VerificationURIComplete) {
+		return deviceAuthorization{}, fmt.Errorf("xAI Device Flow 返回字段不完整")
+	}
+	if device.Interval <= 0 {
+		device.Interval = 5
+	}
+	if device.ExpiresIn <= 0 {
+		device.ExpiresIn = 1800
+	}
+	return deviceAuthorization{
+		DeviceCode: device.DeviceCode, UserCode: device.UserCode,
+		VerificationURIComplete: device.VerificationURIComplete,
+		Interval:                device.Interval, ExpiresIn: device.ExpiresIn,
+	}, nil
+}
+
 type ssoBuildToken struct {
 	AccessToken  string
 	RefreshToken string
@@ -175,7 +283,7 @@ func (f *ssoBuildFlow) pollToken(ctx context.Context, deviceCode string, interva
 	if interval < time.Second {
 		interval = time.Second
 	}
-	deadline := time.Now().Add(min(expiresIn, 75*time.Second))
+	deadline := time.Now().Add(min(expiresIn, ssoBuildTokenPollCap))
 	for time.Now().Before(deadline) {
 		timer := time.NewTimer(interval)
 		select {
@@ -188,7 +296,8 @@ func (f *ssoBuildFlow) pollToken(ctx context.Context, deviceCode string, interva
 			"grant_type": {"urn:ietf:params:oauth:grant-type:device_code"}, "client_id": {ssoBuildClientID}, "device_code": {deviceCode},
 		})
 		if err != nil {
-			return ssoBuildToken{}, err
+			// 对齐 GM：轮询阶段网络抖动不立刻失败。
+			continue
 		}
 		var payload struct {
 			AccessToken      string `json:"access_token"`
@@ -311,6 +420,80 @@ func (f *ssoBuildFlow) cookieHeader() string {
 		parts = append(parts, key+"="+f.cookies[key])
 	}
 	return strings.Join(parts, "; ")
+}
+
+func (f *ssoBuildFlow) backoff(ctx context.Context, attempt int) error {
+	if attempt < 1 {
+		attempt = 1
+	}
+	shift := attempt - 1
+	if shift > 4 {
+		shift = 4
+	}
+	delay := ssoBuildBackoffBase * time.Duration(1<<shift)
+	if delay > ssoBuildBackoffCap {
+		delay = ssoBuildBackoffCap
+	}
+	if f.sleep != nil {
+		return f.sleep(ctx, delay)
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func isSSOConversionRateLimited(status int, finalURL, body string) bool {
+	if status == http.StatusTooManyRequests {
+		return true
+	}
+	blob := strings.ToLower(finalURL + "\n" + body)
+	for _, token := range []string{
+		"rate_limited", "rate-limited", "too_many_requests", "ratelimit",
+		`"status":429`, "slow_down", `"error":"slow_down"`,
+	} {
+		if strings.Contains(blob, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func isRetryableSSOConversionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr conversionHTTPError
+	if errors.As(err, &statusErr) && (statusErr.status == http.StatusTooManyRequests || statusErr.status == 0) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	for _, token := range []string{"限流", "slow_down", "rate_limited", "too many", "429"} {
+		if strings.Contains(message, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func isTransientSSOConversionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, token := range []string{"timeout", "timed out", "connection reset", "connection refused", "eof", "broken pipe", "tls handshake", "i/o timeout", "temporary"} {
+		if strings.Contains(message, token) {
+			return true
+		}
+	}
+	return false
 }
 
 func safeXAIURL(raw string) bool {
