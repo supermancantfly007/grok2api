@@ -276,6 +276,7 @@ export type HealthProbeItemDTO = {
   status: HealthProbeStatus;
   error?: string;
   elapsedMs: number;
+  refreshed?: boolean;
 };
 
 export type HealthProbeSummaryDTO = {
@@ -288,6 +289,7 @@ export type HealthProbeSummaryDTO = {
   network: number;
   error: number;
   unknown: number;
+  refreshed: number;
   items: HealthProbeItemDTO[];
 };
 
@@ -300,7 +302,7 @@ export type AccountImportResultDTO = {
 
 export type WebConsoleSyncResultDTO = AccountImportResultDTO & { skipped: number };
 
-type AccountTaskStreamPayload = Partial<BuildConversionResultDTO & AccountTaskProgressDTO & AccountTokenRefreshResultDTO & AccountImportResultDTO & Omit<HealthProbeSummaryDTO, "error" | "items">> & {
+type AccountTaskStreamPayload = Partial<BuildConversionResultDTO & AccountTaskProgressDTO & AccountTokenRefreshResultDTO & AccountImportResultDTO & Omit<HealthProbeSummaryDTO, "error" | "items" | "refreshed">> & {
   code?: string;
   message?: string;
   accountId?: string;
@@ -311,15 +313,18 @@ type AccountTaskStreamPayload = Partial<BuildConversionResultDTO & AccountTaskPr
   status?: HealthProbeStatus;
   // result 事件为字符串详情；complete 汇总里为 error 计数（数字）
   error?: string | number;
+  // result 事件：是否已重刷；complete 汇总：重刷成功账号数
+  refreshed?: boolean | number;
   elapsedMs?: number;
   items?: HealthProbeItemDTO[];
 };
 
 const isStringOrNumber: (value: unknown) => boolean = (value) => typeof value === "string" || (typeof value === "number" && Number.isFinite(value));
+const isBooleanOrNumber: (value: unknown) => boolean = (value) => typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value));
 const healthProbeStatusValidator = isOneOf("healthy", "unauthorized", "payment", "forbidden", "rate_limited", "network", "error", "unknown");
 const healthProbeItemValidator = hasShape({
   accountId: isString, name: isString, email: isOptional(isString), enabled: isBoolean, httpStatus: isNumber,
-  status: healthProbeStatusValidator, error: isOptional(isString), elapsedMs: isNumber,
+  status: healthProbeStatusValidator, error: isOptional(isString), elapsedMs: isNumber, refreshed: isOptional(isBoolean),
 });
 const decodeAccountTaskStreamPayload = createObjectDecoder<AccountTaskStreamPayload>("account task event", {
   created: isOptional(isNumber), linked: isOptional(isNumber), skipped: isOptional(isNumber), failed: isOptional(isNumber),
@@ -327,7 +332,8 @@ const decodeAccountTaskStreamPayload = createObjectDecoder<AccountTaskStreamPayl
   phase: isOptional(isOneOf("importing", "converting", "syncing", "probing")), updated: isOptional(isNumber), succeeded: isOptional(isNumber),
   healthy: isOptional(isNumber), unauthorized: isOptional(isNumber), payment: isOptional(isNumber), forbidden: isOptional(isNumber),
   rateLimited: isOptional(isNumber), network: isOptional(isNumber), error: isOptional(isStringOrNumber), unknown: isOptional(isNumber),
-  items: isOptional(isArrayOf(healthProbeItemValidator)),
+  // result 事件为 boolean；complete 汇总为计数
+  refreshed: isOptional(isBooleanOrNumber), items: isOptional(isArrayOf(healthProbeItemValidator)),
   accountId: isOptional(isString), name: isOptional(isString), email: isOptional(isString), enabled: isOptional(isBoolean),
   httpStatus: isOptional(isNumber), status: isOptional(healthProbeStatusValidator), elapsedMs: isOptional(isNumber),
   code: isOptional(isString), message: isOptional(isString),
@@ -461,6 +467,7 @@ export async function probeBuildAccountHealth(
           status: data.status,
           error: typeof data.error === "string" ? data.error : undefined,
           elapsedMs: data.elapsedMs,
+          refreshed: data.refreshed === true,
         });
         return;
       }
@@ -473,6 +480,9 @@ export async function probeBuildAccountHealth(
           && data.error >= 0
           && Array.isArray(data.items)
         ) {
+          const refreshed = typeof data.refreshed === "number" && Number.isInteger(data.refreshed) && data.refreshed >= 0
+            ? data.refreshed
+            : (data.items as HealthProbeItemDTO[]).filter((item) => item.refreshed).length;
           result = {
             total: data.total as number,
             healthy: data.healthy as number,
@@ -483,6 +493,7 @@ export async function probeBuildAccountHealth(
             network: data.network as number,
             error: data.error,
             unknown: data.unknown as number,
+            refreshed,
             items: data.items,
           };
         }

@@ -96,6 +96,7 @@ export function AccountHealthPage() {
           network: remaining.filter((item) => item.status === "network").length,
           error: remaining.filter((item) => item.status === "error").length,
           unknown: remaining.filter((item) => item.status === "unknown").length,
+          refreshed: remaining.filter((item) => item.refreshed).length,
         };
       });
       setDeleteForbiddenOpen(false);
@@ -144,9 +145,10 @@ export function AccountHealthPage() {
         </div>
       </header>
 
-      <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+      <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
         <ProbeMetric label={t("accounts.probeMetricTotal")} value={probeSummary?.total ?? probeItems.length} loading={probeMutation.isPending && probeItems.length === 0} />
         <ProbeMetric label={t("accounts.probeStatus.healthy")} value={probeSummary?.healthy ?? countStatus(probeItems, "healthy")} loading={probeMutation.isPending && probeItems.length === 0} tone="healthy" />
+        <ProbeMetric label={t("accounts.probeMetricRefreshed")} value={probeSummary?.refreshed ?? probeItems.filter((item) => item.refreshed).length} loading={probeMutation.isPending && probeItems.length === 0} tone="healthy" />
         <ProbeMetric label={t("accounts.probeStatus.forbidden")} value={probeSummary?.forbidden ?? countStatus(probeItems, "forbidden")} loading={probeMutation.isPending && probeItems.length === 0} tone="danger" />
         <ProbeMetric label={t("accounts.probeStatus.rateLimited")} value={probeSummary?.rateLimited ?? countStatus(probeItems, "rate_limited")} loading={probeMutation.isPending && probeItems.length === 0} tone="warn" />
       </section>
@@ -215,7 +217,12 @@ export function AccountHealthPage() {
                       </div>
                     </div>
                   </TableCell>
-                  <TableCell><HealthProbeStatusBadge status={item.status} /></TableCell>
+                  <TableCell>
+                    <div className="flex flex-wrap items-center gap-1">
+                      <HealthProbeStatusBadge status={item.status} />
+                      {item.refreshed ? <Badge variant="outline" className="border-transparent bg-sky-500/15 text-sky-700 dark:text-sky-300">{t("accounts.probeRefreshedBadge")}</Badge> : null}
+                    </div>
+                  </TableCell>
                   <TableCell className="tabular-nums text-muted-foreground">{item.httpStatus || "-"}</TableCell>
                   <TableCell className="tabular-nums text-muted-foreground">{item.elapsedMs}ms</TableCell>
                   <TableCell className="truncate text-xs text-muted-foreground" title={item.error || undefined}>{item.error || "-"}</TableCell>

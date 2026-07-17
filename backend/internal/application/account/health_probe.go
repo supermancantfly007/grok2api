@@ -45,6 +45,9 @@ type HealthProbeItem struct {
 	Status     HealthProbeStatus
 	Error      string
 	ElapsedMs  int64
+	// Refreshed 表示测活过程中因 401 触发了 OAuth 凭据重刷，且刷新本身成功。
+	// 最终 Status 可能仍为 unauthorized（重刷后上游仍拒绝）。
+	Refreshed bool
 }
 
 // HealthProbeSummary 测活汇总。
@@ -58,19 +61,22 @@ type HealthProbeSummary struct {
 	Network      int
 	Error        int
 	Unknown      int
-	Items        []HealthProbeItem
+	// Refreshed 表示因 401 自动重刷成功的账号数（含重刷后仍 401）。
+	Refreshed int
+	Items     []HealthProbeItem
 }
 
 // HealthProbeObserver 在每个账号测活结束后回调（completed 从 1 递增）。
 type HealthProbeObserver func(item HealthProbeItem, completed, total int) error
 
 // ProbeBuildHealth 并发探测全部 Grok Build 账号的上游可用性。
-// 只读诊断，不修改账号健康度或凭据状态。
+// 遇 HTTP 401 时会自动强制刷新 OAuth 凭据并复测一次（与网关运行时恢复一致）。
 func (s *Service) ProbeBuildHealth(ctx context.Context, observer HealthProbeObserver) (HealthProbeSummary, error) {
 	return s.ProbeBuildHealthWithProgress(ctx, observer, nil)
 }
 
 // ProbeBuildHealthWithProgress 并发探测并报告进度。
+// 对返回 401 且可刷新的账号会写入新 token；刷新后仍 401 会标记 reauthRequired。
 func (s *Service) ProbeBuildHealthWithProgress(ctx context.Context, observer HealthProbeObserver, progress BatchProgressObserver) (HealthProbeSummary, error) {
 	adapter, err := s.buildProbeAdapter()
 	if err != nil {
@@ -144,6 +150,9 @@ func (s *Service) ProbeBuildHealthWithProgress(ctx context.Context, observer Hea
 
 	out := HealthProbeSummary{Total: len(items), Items: items}
 	for _, item := range items {
+		if item.Refreshed {
+			out.Refreshed++
+		}
 		switch item.Status {
 		case HealthProbeHealthy:
 			out.Healthy++
@@ -208,11 +217,68 @@ func (s *Service) probeOneBuildAccount(ctx context.Context, adapter buildHealthP
 	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, healthProbeRequestTimeout)
-	defer cancel()
 	statusCode, err := adapter.ProbeResponses(probeCtx, value, accessToken)
-	item.ElapsedMs = time.Since(started).Milliseconds()
+	cancel()
 	item.HTTPStatus = statusCode
 	item.Status, item.Error = classifyHealthProbe(statusCode, err)
+
+	// 401 时自动强制 OAuth 重刷并复测，对齐网关运行时恢复与 grok-manager 的 401 重刷流水线。
+	if item.Status == HealthProbeUnauthorized {
+		item = s.recoverUnauthorizedBuildProbe(ctx, adapter, value, item)
+	}
+
+	item.ElapsedMs = time.Since(started).Milliseconds()
+	return item
+}
+
+// recoverUnauthorizedBuildProbe 在首次测活 401 后尝试刷新凭据并复测。
+// 刷新成功后若仍 401，标记 reauthRequired 并退出号池。
+func (s *Service) recoverUnauthorizedBuildProbe(ctx context.Context, adapter buildHealthProber, value accountdomain.Credential, item HealthProbeItem) HealthProbeItem {
+	if s.providers == nil || !s.providers.SupportsCredentialRefresh(value.Provider) || strings.TrimSpace(value.EncryptedRefreshToken) == "" {
+		item.Error = "HTTP 401（无可用 refresh token，无法自动重刷）"
+		return item
+	}
+	if ctx.Err() != nil {
+		item.Status = HealthProbeNetwork
+		item.Error = truncateProbeError(ctx.Err().Error())
+		return item
+	}
+
+	// 测活路径绕过进程内强制刷新节流，确保诊断结果反映当前可恢复性。
+	refreshed, refreshErr := s.ensureCredential(ctx, value, true, true, false)
+	if refreshErr != nil {
+		item.Error = "HTTP 401，自动重刷失败: " + truncateProbeError(refreshErr.Error())
+		return item
+	}
+	item.Refreshed = true
+
+	accessToken, err := s.cipher.Decrypt(refreshed.EncryptedAccessToken)
+	if err != nil || strings.TrimSpace(accessToken) == "" {
+		item.Status = HealthProbeError
+		item.Error = "重刷成功但读取新 access token 失败"
+		return item
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, healthProbeRequestTimeout)
+	statusCode, err := adapter.ProbeResponses(probeCtx, refreshed, accessToken)
+	cancel()
+	item.HTTPStatus = statusCode
+	item.Status, item.Error = classifyHealthProbe(statusCode, err)
+	if item.Status == HealthProbeUnauthorized {
+		item.Error = "HTTP 401（已重刷，上游仍拒绝）"
+		// 刷新后仍被拒说明 refresh token 也已失效，与网关行为一致标记 reauth。
+		if markErr := s.MarkReauthRequired(context.WithoutCancel(ctx), value.ID, "Grok Build OAuth credential rejected after health-probe refresh"); markErr != nil {
+			s.logger.Warn("health_probe_reauth_mark_failed", "account_id", value.ID, "error", markErr)
+		}
+		return item
+	}
+	if item.Status == HealthProbeHealthy {
+		item.Error = "已自动重刷"
+	} else if item.Error != "" {
+		item.Error = "已自动重刷后: " + item.Error
+	} else {
+		item.Error = "已自动重刷"
+	}
 	return item
 }
 

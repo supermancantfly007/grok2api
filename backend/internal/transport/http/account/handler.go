@@ -1011,6 +1011,7 @@ type healthProbeItemResponse struct {
 	Status     string `json:"status"`
 	Error      string `json:"error,omitempty"`
 	ElapsedMs  int64  `json:"elapsedMs"`
+	Refreshed  bool   `json:"refreshed,omitempty"`
 }
 
 type healthProbeSummaryResponse struct {
@@ -1023,6 +1024,7 @@ type healthProbeSummaryResponse struct {
 	Network      int                       `json:"network"`
 	Error        int                       `json:"error"`
 	Unknown      int                       `json:"unknown"`
+	Refreshed    int                       `json:"refreshed"`
 	Items        []healthProbeItemResponse `json:"items"`
 }
 
@@ -1036,6 +1038,7 @@ func newHealthProbeItemResponse(item accountapp.HealthProbeItem) healthProbeItem
 		Status:     string(item.Status),
 		Error:      item.Error,
 		ElapsedMs:  item.ElapsedMs,
+		Refreshed:  item.Refreshed,
 	}
 }
 
@@ -1047,7 +1050,7 @@ func newHealthProbeSummaryResponse(value accountapp.HealthProbeSummary) healthPr
 	return healthProbeSummaryResponse{
 		Total: value.Total, Healthy: value.Healthy, Unauthorized: value.Unauthorized,
 		Payment: value.Payment, Forbidden: value.Forbidden, RateLimited: value.RateLimited,
-		Network: value.Network, Error: value.Error, Unknown: value.Unknown, Items: items,
+		Network: value.Network, Error: value.Error, Unknown: value.Unknown, Refreshed: value.Refreshed, Items: items,
 	}
 }
 
