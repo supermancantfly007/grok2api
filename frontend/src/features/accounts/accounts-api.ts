@@ -569,6 +569,29 @@ export function deleteAccounts(ids: string[], provider: AccountProvider): Promis
   return apiRequest("/api/admin/v1/accounts", { method: "DELETE", body: { ids, provider } }, decodeCountResult<{ deleted: number }>("deleted"));
 }
 
+/** 账号列表中的非可用状态，可按状态整批删除（不含 active）。 */
+export type NonAvailableAccountStatus = "disabled" | "reauthRequired" | "cooldown" | "waitingReset" | "probing";
+
+export const NON_AVAILABLE_ACCOUNT_STATUSES: NonAvailableAccountStatus[] = [
+  "disabled",
+  "reauthRequired",
+  "cooldown",
+  "waitingReset",
+  "probing",
+];
+
+export function isNonAvailableAccountStatus(status: string): status is NonAvailableAccountStatus {
+  return (NON_AVAILABLE_ACCOUNT_STATUSES as string[]).includes(status);
+}
+
+export function deleteAccountsByStatus(provider: AccountProvider, status: NonAvailableAccountStatus): Promise<{ deleted: number; status: string; provider: string }> {
+  return apiRequest(
+    "/api/admin/v1/accounts/batch/delete-by-status",
+    { method: "POST", body: { provider, status } },
+    createObjectDecoder("delete by status", { deleted: isNumber, status: isString, provider: isString }),
+  );
+}
+
 export function startDeviceAuthorization(): Promise<DeviceSessionDTO> {
   return apiRequest("/api/admin/v1/accounts/device/start", { method: "POST" }, decodeDeviceSession);
 }

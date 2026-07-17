@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Activity, Trash2 } from "lucide-react";
+import { Activity, ChevronDown, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import {
@@ -25,6 +26,16 @@ function isAbortError(error: unknown): boolean {
   return (error instanceof DOMException || error instanceof Error) && error.name === "AbortError";
 }
 
+const DELETABLE_PROBE_STATUSES: HealthProbeStatus[] = [
+  "unauthorized",
+  "payment",
+  "forbidden",
+  "rate_limited",
+  "network",
+  "error",
+  "unknown",
+];
+
 export function AccountHealthPage() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -33,7 +44,7 @@ export function AccountHealthPage() {
   const [probeItems, setProbeItems] = useState<HealthProbeItemDTO[]>([]);
   const [probeSummary, setProbeSummary] = useState<HealthProbeSummaryDTO | null>(null);
   const [probeFilter, setProbeFilter] = useState<HealthProbeStatus | "all">("all");
-  const [deleteForbiddenOpen, setDeleteForbiddenOpen] = useState(false);
+  const [deleteStatusTarget, setDeleteStatusTarget] = useState<HealthProbeStatus | null>(null);
 
   useEffect(() => () => {
     probeAbortRef.current?.abort();
@@ -71,15 +82,40 @@ export function AccountHealthPage() {
     },
   });
 
-  const forbiddenItems = useMemo(
-    () => probeItems.filter((item) => item.status === "forbidden"),
-    [probeItems],
+  const statusCounts = useMemo(() => {
+    const counts = Object.fromEntries(DELETABLE_PROBE_STATUSES.map((status) => [status, 0])) as Record<HealthProbeStatus, number>;
+    for (const item of probeItems) {
+      if (item.status !== "healthy") {
+        counts[item.status] = (counts[item.status] ?? 0) + 1;
+      }
+    }
+    return counts;
+  }, [probeItems]);
+
+  const deletableStatusOptions = useMemo(
+    () => DELETABLE_PROBE_STATUSES
+      .map((status) => ({ status, count: statusCounts[status] ?? 0 }))
+      .filter((entry) => entry.count > 0),
+    [statusCounts],
   );
 
-  const deleteForbiddenMutation = useMutation({
-    mutationFn: () => deleteAccounts(forbiddenItems.map((item) => item.accountId), "grok_build"),
-    onSuccess: (result) => {
-      const removed = new Set(forbiddenItems.map((item) => item.accountId));
+  const deleteTargetItems = useMemo(
+    () => (deleteStatusTarget ? probeItems.filter((item) => item.status === deleteStatusTarget) : []),
+    [probeItems, deleteStatusTarget],
+  );
+
+  const deleteByStatusMutation = useMutation({
+    mutationFn: async (status: HealthProbeStatus) => {
+      const ids = probeItems.filter((item) => item.status === status).map((item) => item.accountId);
+      let deleted = 0;
+      for (let start = 0; start < ids.length; start += 500) {
+        const result = await deleteAccounts(ids.slice(start, start + 500), "grok_build");
+        deleted += result.deleted;
+      }
+      return { deleted };
+    },
+    onSuccess: (result, status) => {
+      const removed = new Set(probeItems.filter((item) => item.status === status).map((item) => item.accountId));
       setProbeItems((current) => current.filter((item) => !removed.has(item.accountId)));
       setProbeSummary((current) => {
         if (!current) return current;
@@ -87,11 +123,11 @@ export function AccountHealthPage() {
         return {
           ...current,
           total: remaining.length,
-          forbidden: 0,
           items: remaining,
           healthy: remaining.filter((item) => item.status === "healthy").length,
           unauthorized: remaining.filter((item) => item.status === "unauthorized").length,
           payment: remaining.filter((item) => item.status === "payment").length,
+          forbidden: remaining.filter((item) => item.status === "forbidden").length,
           rateLimited: remaining.filter((item) => item.status === "rate_limited").length,
           network: remaining.filter((item) => item.status === "network").length,
           error: remaining.filter((item) => item.status === "error").length,
@@ -99,9 +135,12 @@ export function AccountHealthPage() {
           refreshed: remaining.filter((item) => item.refreshed).length,
         };
       });
-      setDeleteForbiddenOpen(false);
+      setDeleteStatusTarget(null);
       void queryClient.invalidateQueries({ queryKey: ["accounts"] });
-      toast.success(t("accounts.probeDeleteForbiddenCompleted", { deleted: result.deleted, count: forbiddenItems.length }));
+      toast.success(t("accounts.probeDeleteStatusCompleted", {
+        deleted: result.deleted,
+        status: probeStatusLabel(t, status),
+      }));
     },
     onError: (error) => {
       toast.error(error instanceof Error ? error.message : t("errors.generic"));
@@ -115,6 +154,10 @@ export function AccountHealthPage() {
     [probeItems, probeFilter],
   );
 
+  const activeFilterDeleteCount = probeFilter !== "all" && probeFilter !== "healthy"
+    ? (statusCounts[probeFilter] ?? 0)
+    : 0;
+
   return (
     <div className="space-y-8">
       <header className="flex flex-wrap items-start justify-between gap-3">
@@ -123,16 +166,41 @@ export function AccountHealthPage() {
           <p className="mt-1 max-w-3xl text-sm text-muted-foreground">{t("accounts.probeHealthDescription")}</p>
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
-          <Button
-            type="button"
-            variant="secondary"
-            size="sm"
-            disabled={probeMutation.isPending || forbiddenItems.length === 0}
-            onClick={() => setDeleteForbiddenOpen(true)}
-          >
-            <Trash2 />
-            {t("accounts.probeDeleteForbidden", { count: forbiddenItems.length })}
-          </Button>
+          {activeFilterDeleteCount > 0 ? (
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              disabled={probeMutation.isPending || deleteByStatusMutation.isPending}
+              onClick={() => setDeleteStatusTarget(probeFilter as HealthProbeStatus)}
+            >
+              <Trash2 />
+              {t("accounts.probeDeleteStatusAction", {
+                status: probeStatusLabel(t, probeFilter),
+                count: activeFilterDeleteCount,
+              })}
+            </Button>
+          ) : deletableStatusOptions.length > 0 ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button type="button" variant="secondary" size="sm" disabled={probeMutation.isPending || deleteByStatusMutation.isPending}>
+                  <Trash2 />
+                  {t("accounts.probeDeleteStatusMenu")}
+                  <ChevronDown className="size-3.5 opacity-70" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                {deletableStatusOptions.map(({ status, count }) => (
+                  <DropdownMenuItem key={status} onClick={() => setDeleteStatusTarget(status)}>
+                    {t("accounts.probeDeleteStatusAction", {
+                      status: probeStatusLabel(t, status),
+                      count,
+                    })}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : null}
           <Button
             type="button"
             size="sm"
@@ -233,23 +301,32 @@ export function AccountHealthPage() {
         ) : null}
       </DataTableShell>
 
-      <AlertDialog open={deleteForbiddenOpen} onOpenChange={setDeleteForbiddenOpen}>
+      <AlertDialog open={deleteStatusTarget !== null} onOpenChange={(open) => { if (!open) setDeleteStatusTarget(null); }}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>{t("accounts.probeDeleteForbiddenTitle", { count: forbiddenItems.length })}</AlertDialogTitle>
-            <AlertDialogDescription>{t("accounts.probeDeleteForbiddenDescription", { count: forbiddenItems.length })}</AlertDialogDescription>
+            <AlertDialogTitle>
+              {t("accounts.probeDeleteStatusTitle", {
+                status: probeStatusLabel(t, deleteStatusTarget ?? "forbidden"),
+                count: deleteTargetItems.length,
+              })}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("accounts.probeDeleteStatusDescription", {
+                status: probeStatusLabel(t, deleteStatusTarget ?? "forbidden"),
+              })}
+            </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
             <AlertDialogAction
               className="bg-destructive text-white hover:bg-destructive/90"
-              disabled={deleteForbiddenMutation.isPending || forbiddenItems.length === 0}
+              disabled={deleteByStatusMutation.isPending || !deleteStatusTarget || deleteTargetItems.length === 0}
               onClick={(event) => {
                 event.preventDefault();
-                deleteForbiddenMutation.mutate();
+                if (deleteStatusTarget) deleteByStatusMutation.mutate(deleteStatusTarget);
               }}
             >
-              {deleteForbiddenMutation.isPending ? <Spinner /> : null}
+              {deleteByStatusMutation.isPending ? <Spinner /> : null}
               {t("common.delete")}
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -277,9 +354,17 @@ function healthProbeStatusRank(status: HealthProbeStatus): number {
   }
 }
 
+function probeStatusLabel(t: (key: string) => string, status: string): string {
+  if (status === "rate_limited") return t("accounts.probeStatus.rateLimited");
+  if (status === "healthy" || status === "unauthorized" || status === "payment" || status === "forbidden" || status === "network" || status === "error" || status === "unknown") {
+    return t(`accounts.probeStatus.${status}`);
+  }
+  return status;
+}
+
 function HealthProbeStatusBadge({ status }: { status: HealthProbeStatus }) {
   const { t } = useTranslation();
-  const label = t(`accounts.probeStatus.${status === "rate_limited" ? "rateLimited" : status}`);
+  const label = probeStatusLabel(t, status);
   const className = status === "healthy"
     ? "border-transparent bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
     : status === "forbidden" || status === "unauthorized"

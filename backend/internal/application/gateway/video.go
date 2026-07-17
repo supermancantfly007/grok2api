@@ -326,14 +326,18 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		}
 		failureCtx, failureCancel := context.WithTimeout(context.Background(), finalizationTimeout)
 		failureHandled := false
-		if errors.Is(err, provider.ErrUnauthorized) {
-			if lease.Credential.AuthType == account.AuthTypeSSO {
-				_ = s.accounts.MarkReauthRequired(failureCtx, lease.Credential.ID, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
-			}
-			s.selector.MarkFailure(failureCtx, lease.Credential, http.StatusUnauthorized, 0)
-			failureHandled = true
-		} else if status, ok := provider.ErrorHTTPStatus(err); ok {
+		if status, ok := provider.ErrorHTTPStatus(err); ok {
 			switch {
+			case status == http.StatusUnauthorized:
+				// 视频任务已绑定账号，不能换号；401 时强制刷新 OAuth，失败则踢出号池。
+				if lease.Credential.AuthType == account.AuthTypeSSO {
+					s.excludeUnavailableAccount(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
+				} else if _, refreshErr := s.accounts.EnsureCredential(failureCtx, lease.Credential, true); refreshErr != nil {
+					s.excludeUnavailableAccount(failureCtx, lease.Credential, fmt.Sprintf("%s OAuth force refresh failed after video 401", lease.Credential.Provider))
+				} else {
+					s.excludeUnavailableAccount(failureCtx, lease.Credential, fmt.Sprintf("%s credential rejected during video job", lease.Credential.Provider))
+				}
+				failureHandled = true
 			case status == http.StatusForbidden && s.providers.RetryForbiddenAsEgress(lease.Credential.Provider):
 				// Web Provider 已对 anti-bot 403 降低出口健康并重建浏览器会话；
 				// 视频请求已提交，不能换号重试，也不能误伤账号池。
@@ -341,8 +345,8 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 				failureHandled = true
 			case status == http.StatusForbidden && lease.Credential.Provider == account.ProviderBuild:
 				if lease.Billing == nil || !lease.Billing.IsPaid() {
-					// Free/Unknown 不具备 XAI 回退资格；主 Build 403 表示该账号当前异常。
-					s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
+					// Free/Unknown 不具备 XAI 回退资格；主 Build 403 踢出号池等待人工删除。
+					s.excludeUnavailableAccount(failureCtx, lease.Credential, fmt.Sprintf("Grok Build Free account rejected with HTTP %d", status))
 				}
 				// Super 的 XAI 探测在 Adapter 内完成；其 403 保持服务级处理。
 				failureHandled = true
@@ -360,6 +364,15 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 				s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
 				failureHandled = true
 			}
+		} else if errors.Is(err, provider.ErrUnauthorized) {
+			if lease.Credential.AuthType == account.AuthTypeSSO {
+				s.excludeUnavailableAccount(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
+			} else if _, refreshErr := s.accounts.EnsureCredential(failureCtx, lease.Credential, true); refreshErr != nil {
+				s.excludeUnavailableAccount(failureCtx, lease.Credential, fmt.Sprintf("%s OAuth force refresh failed after video 401", lease.Credential.Provider))
+			} else {
+				s.excludeUnavailableAccount(failureCtx, lease.Credential, fmt.Sprintf("%s credential rejected during video job", lease.Credential.Provider))
+			}
+			failureHandled = true
 		}
 		if !failureHandled && !provider.IsMediaPostProcessingError(err) {
 			s.selector.MarkFailure(failureCtx, lease.Credential, 0, 0)

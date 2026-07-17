@@ -146,7 +146,7 @@ func TestProbeBuildHealthMarksReauthWhenStillUnauthorizedAfterRefresh(t *testing
 func TestProbeBuildHealthSkipsRefreshWithoutRefreshToken(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	service, _, adapter, _ := newHealthProbeTestService(t, healthProbeFixture{withRefreshToken: false})
+	service, credential, adapter, _ := newHealthProbeTestService(t, healthProbeFixture{withRefreshToken: false})
 	adapter.probeStatus = http.StatusUnauthorized
 
 	summary, err := service.ProbeBuildHealth(ctx, nil)
@@ -162,6 +162,105 @@ func TestProbeBuildHealthSkipsRefreshWithoutRefreshToken(t *testing.T) {
 	if !strings.Contains(summary.Items[0].Error, "无法自动重刷") {
 		t.Fatalf("error = %q", summary.Items[0].Error)
 	}
+	updated, err := service.accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.AuthStatus != accountdomain.AuthStatusReauthRequired {
+		t.Fatalf("auth status = %s, want reauthRequired", updated.AuthStatus)
+	}
+}
+
+func TestProbeBuildHealthSyncsForbiddenAndCooldownStatuses(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("forbidden marks reauth", func(t *testing.T) {
+		service, credential, adapter, _ := newHealthProbeTestService(t)
+		adapter.probeStatus = http.StatusForbidden
+		summary, err := service.ProbeBuildHealth(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if summary.Forbidden != 1 {
+			t.Fatalf("summary = %#v", summary)
+		}
+		updated, err := service.accounts.Get(ctx, credential.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.AuthStatus != accountdomain.AuthStatusReauthRequired {
+			t.Fatalf("auth status = %s", updated.AuthStatus)
+		}
+		if !strings.Contains(updated.LastError, "403") && !strings.Contains(updated.LastError, "health probe") {
+			t.Fatalf("last error = %q", updated.LastError)
+		}
+	})
+
+	t.Run("rate limited sets cooldown", func(t *testing.T) {
+		service, credential, adapter, _ := newHealthProbeTestService(t)
+		adapter.probeStatus = http.StatusTooManyRequests
+		if _, err := service.ProbeBuildHealth(ctx, nil); err != nil {
+			t.Fatal(err)
+		}
+		updated, err := service.accounts.Get(ctx, credential.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.AuthStatus != accountdomain.AuthStatusActive {
+			t.Fatalf("auth status = %s", updated.AuthStatus)
+		}
+		if updated.FailureCount != 1 || updated.CooldownUntil == nil || !updated.CooldownUntil.After(time.Now().UTC()) {
+			t.Fatalf("cooldown state = %#v", updated)
+		}
+	})
+
+	t.Run("healthy clears cooldown and reactivates", func(t *testing.T) {
+		service, credential, adapter, _ := newHealthProbeTestService(t)
+		until := time.Now().UTC().Add(10 * time.Minute)
+		if err := service.accounts.UpdateHealth(ctx, credential.ID, 3, &until, "old failure", false); err != nil {
+			t.Fatal(err)
+		}
+		if err := service.MarkReauthRequired(ctx, credential.ID, "previous reauth"); err != nil {
+			t.Fatal(err)
+		}
+		adapter.probeStatus = http.StatusOK
+		if _, err := service.ProbeBuildHealth(ctx, nil); err != nil {
+			t.Fatal(err)
+		}
+		updated, err := service.accounts.Get(ctx, credential.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.AuthStatus != accountdomain.AuthStatusActive {
+			t.Fatalf("auth status = %s", updated.AuthStatus)
+		}
+		if updated.FailureCount != 0 || updated.CooldownUntil != nil || updated.LastError != "" {
+			t.Fatalf("healthy state not cleared: %#v", updated)
+		}
+	})
+
+	t.Run("network only records last error", func(t *testing.T) {
+		service, credential, adapter, _ := newHealthProbeTestService(t)
+		adapter.probeStatus = 0
+		adapter.probeErr = &net.OpError{Op: "dial", Err: errors.New("connection refused")}
+		if _, err := service.ProbeBuildHealth(ctx, nil); err != nil {
+			t.Fatal(err)
+		}
+		updated, err := service.accounts.Get(ctx, credential.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.AuthStatus != accountdomain.AuthStatusActive {
+			t.Fatalf("auth status = %s", updated.AuthStatus)
+		}
+		if updated.CooldownUntil != nil {
+			t.Fatalf("network should not cooldown: %#v", updated)
+		}
+		if !strings.Contains(updated.LastError, "health probe") {
+			t.Fatalf("last error = %q", updated.LastError)
+		}
+	})
 }
 
 type healthProbeFixture struct {
@@ -221,6 +320,7 @@ func newHealthProbeTestService(t *testing.T, fixtures ...healthProbeFixture) (*S
 type healthProbeAdapter struct {
 	cipher       *security.Cipher
 	probeStatus  int
+	probeErr     error
 	probeByToken map[string]int
 	probeCount   atomic.Int64
 	refreshCount atomic.Int64
@@ -244,6 +344,9 @@ func (a *healthProbeAdapter) ProbeResponses(_ context.Context, _ accountdomain.C
 			return status, nil
 		}
 		return 0, fmt.Errorf("unexpected access token %q", accessToken)
+	}
+	if a.probeErr != nil {
+		return a.probeStatus, a.probeErr
 	}
 	return a.probeStatus, nil
 }

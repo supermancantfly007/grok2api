@@ -44,6 +44,8 @@ const finalizationTimeout = 5 * time.Second
 const textBillingReservationTTL = 2 * time.Hour
 const mediaBillingReservationTTL = 24 * time.Hour
 const modelCatalogRefreshTimeout = 30 * time.Second
+// maxAccountFailoverAttempts 防止出口会话反复放回号池时死循环；正常账号级换号以可用池耗尽为准。
+const maxAccountFailoverAttempts = 256
 
 var freeQuotaUsagePattern = regexp.MustCompile(`(?i)tokens\s*\(actual/limit\)\s*:\s*([0-9]+)\s*/\s*([0-9]+)`)
 
@@ -456,14 +458,13 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if input.PreviousResponseID != "" && !supportsStoredResponses {
 		return nil, ErrResponseStateUnsupported
 	}
-	attempts := int(s.maxAttempts.Load())
-	if attempts <= 0 {
-		attempts = 3
+	// maxAttempts 仅约束出口会话重试与非账号级故障的安全上限；账号级故障会换号直到可用池耗尽。
+	maxAttempts := int(s.maxAttempts.Load())
+	if maxAttempts <= 0 {
+		maxAttempts = 3
 	}
 	idempotencyID, _ := security.NewOpaqueToken(18)
-	if ownership != nil {
-		attempts = 1
-	}
+	pinnedAccount := ownership != nil
 	pricingModel := s.providers.PricingModel(route.Provider, route.UpstreamModel)
 	if reservation, priced := audit.EstimateOfficialTextReservation(pricingModel, input.Body); priced {
 		if _, err := s.clientKeys.ReserveBilling(ctx, input.ClientKey, eventID, reservation.CostInUSDTicks, textBillingReservationTTL); err != nil {
@@ -492,8 +493,18 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		timing.markCredential(time.Since(started))
 		return result, err
 	}
+	attempt := 0
+	egressRetries := 0
 attemptLoop:
-	for attempt := 0; attempt < attempts; attempt++ {
+	for {
+		if pinnedAccount && attempt >= 1 {
+			break
+		}
+		// 防止出口会话反复放回号池时死循环；账号级换号以可用池耗尽为准。
+		if attempt >= maxAccountFailoverAttempts {
+			break
+		}
+		attempt++
 		var lease *accountLease
 		var err error
 		selectionStarted := time.Now()
@@ -518,7 +529,8 @@ attemptLoop:
 			}
 			lastErr = fmt.Errorf("上游 Team 与模型请求频率受限")
 			s.logger.Warn("upstream_team_model_rate_limit_active", "request_id", input.RequestID, "provider", route.Provider, "model", route.UpstreamModel, "team_fingerprint", limited.TeamFingerprint, "retry_after", lastFailure.RetryAfter.Round(time.Second))
-			attempt--
+			// Team 限流是共享状态，不计入账号排除；从 excluded 拿回以便其它路径，但本轮已标记 excluded。
+			// 继续换号：该账号本请求内不再选中（已在 excluded）。
 			continue
 		}
 		if lease.QuotaProbe {
@@ -565,8 +577,7 @@ attemptLoop:
 		if response.StatusCode == http.StatusUnauthorized {
 			response.Body.Close()
 			if credential.AuthType == accountdomain.AuthTypeSSO {
-				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
-				s.selector.MarkFailure(ctx, credential, http.StatusUnauthorized, 0)
+				s.excludeUnavailableAccount(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
 				lease.Release()
 				lastErr = fmt.Errorf("%s SSO 凭据已失效", credential.Provider)
 				lastFailure = newHTTPUpstreamFailure(http.StatusUnauthorized, nil, credential.ID, credential.Name)
@@ -578,6 +589,7 @@ attemptLoop:
 				lastFailure = newHTTPUpstreamFailure(http.StatusUnauthorized, nil, credential.ID, credential.Name)
 				continue
 			}
+			// Build OAuth：401 时自动强制刷新凭据，成功则同号重试，失败则踢出号池。
 			authRecoveryAttempted[credential.ID] = true
 			refreshed, refreshErr := ensureCredential(credential, true)
 			if refreshErr == nil {
@@ -587,6 +599,8 @@ attemptLoop:
 			if refreshErr != nil || err != nil {
 				if errors.Is(refreshErr, accountapp.ErrCredentialRefreshPermanent) {
 					s.markCredentialRejectedAfterPermanentRefresh(ctx, credential)
+				} else if refreshErr != nil {
+					s.excludeUnavailableAccount(ctx, credential, fmt.Sprintf("%s OAuth force refresh failed after 401", credential.Provider))
 				}
 				lease.Release()
 				lastErr = firstError(refreshErr, err)
@@ -602,8 +616,7 @@ attemptLoop:
 			}
 			if response.StatusCode == http.StatusUnauthorized {
 				body, _ := readRetryableBody(response.Body)
-				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, "Grok Build OAuth credential rejected after refresh")
-				s.selector.MarkQuotaStateChanged(credential.Provider)
+				s.excludeUnavailableAccount(ctx, credential, "Grok Build OAuth credential rejected after force refresh")
 				lease.Release()
 				lastErr = fmt.Errorf("刷新后上游仍返回 401")
 				lastFailure = newHTTPUpstreamFailure(http.StatusUnauthorized, body, credential.ID, credential.Name)
@@ -611,12 +624,13 @@ attemptLoop:
 			}
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
-		finalEgressForbidden := egressForbidden && (attempt > 0 || attempt+1 >= attempts)
+		finalEgressForbidden := egressForbidden && (egressRetries > 0 || egressRetries+1 >= maxAttempts)
 		if isRetryableResponse(response) && !finalEgressForbidden {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
 			if egressForbidden {
 				// Web 403/code 7 表示出口浏览器会话被拒绝；Provider 已重建会话并降低节点健康，不应误伤账号。
+				egressRetries++
 				delete(excluded, credential.ID)
 				lease.Release()
 				lastErr = fmt.Errorf("Grok Web 出口会话被反机器人规则拒绝")
@@ -626,7 +640,7 @@ attemptLoop:
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
 			freeBuildForbidden := response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild && (lease.Billing == nil || !lease.Billing.IsPaid())
 			if freeBuildForbidden {
-				// XAI 不接受 Free 账号。主 Build 403 是该账号当前不可用，必须冷却并换号。
+				// XAI 不接受 Free 账号。主 Build 403 表示该账号当前不可用，移出号池等待人工处理。
 				lastFailure.AccountScoped = true
 			}
 			if response.StatusCode == http.StatusTooManyRequests && response.RateLimit != nil && response.RateLimit.TeamID != "" && response.RateLimit.Model == route.UpstreamModel {
@@ -641,8 +655,14 @@ attemptLoop:
 			}
 			if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
 				authRecoveryAttempted[credential.ID] = true
+				// 401/凭据拒绝：自动强制刷新 OAuth，成功则同号重试。
 				refreshed, refreshErr := ensureCredential(credential, true)
 				if refreshErr != nil {
+					if errors.Is(refreshErr, accountapp.ErrCredentialRefreshPermanent) {
+						s.markCredentialRejectedAfterPermanentRefresh(ctx, credential)
+					} else {
+						s.excludeUnavailableAccount(ctx, credential, fmt.Sprintf("%s OAuth force refresh failed after upstream denial", credential.Provider))
+					}
 					lease.Release()
 					lastErr = refreshErr
 					lastFailure = newCredentialUpstreamFailure(refreshErr, credential.ID, credential.Name)
@@ -664,7 +684,8 @@ attemptLoop:
 			}
 			failureHandled := false
 			if freeBuildForbidden {
-				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				// Free Build 403：标 reauthRequired 踢出号池，便于管理端人工删除。
+				s.excludeUnavailableAccount(ctx, credential, fmt.Sprintf("Grok Build Free account rejected with HTTP %d", response.StatusCode))
 				failureHandled = true
 			} else if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
 				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
@@ -689,17 +710,20 @@ attemptLoop:
 					// model-scoped; only an actual credential rejection requires reauth.
 					s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
 				} else {
-					_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
-					s.selector.MarkQuotaStateChanged(credential.Provider)
+					s.excludeUnavailableAccount(ctx, credential, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
 				}
 				failureHandled = true
 			} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.CredentialRejected {
-				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s credential rejected", credential.Provider))
-				s.selector.MarkQuotaStateChanged(credential.Provider)
+				s.excludeUnavailableAccount(ctx, credential, fmt.Sprintf("%s credential rejected", credential.Provider))
 				failureHandled = true
 			}
 			if lastFailure.AccountScoped && !failureHandled {
-				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				// 账号级 401/403：踢出号池；其余账号级故障仍走冷却。
+				if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+					s.excludeUnavailableAccount(ctx, credential, fmt.Sprintf("upstream HTTP %d", response.StatusCode))
+				} else {
+					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				}
 			}
 			lease.Release()
 			lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
@@ -1002,7 +1026,12 @@ func (s *Service) markPermanentlyUnrefreshableCredentialRejected(ctx context.Con
 }
 
 func (s *Service) markCredentialRejectedAfterPermanentRefresh(ctx context.Context, credential accountdomain.Credential) {
-	_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s OAuth access token rejected after permanent refresh failure", credential.Provider))
+	s.excludeUnavailableAccount(ctx, credential, fmt.Sprintf("%s OAuth access token rejected after permanent refresh failure", credential.Provider))
+}
+
+// excludeUnavailableAccount 将账号标为 reauthRequired 并踢出可用号池，直到人工处理或成功恢复凭据。
+func (s *Service) excludeUnavailableAccount(ctx context.Context, credential accountdomain.Credential, reason string) {
+	_ = s.accounts.MarkReauthRequired(ctx, credential.ID, reason)
 	s.selector.MarkQuotaStateChanged(credential.Provider)
 }
 

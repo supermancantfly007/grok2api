@@ -2,11 +2,13 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
 	"time"
 
+	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
 	"github.com/chenyme/grok2api/backend/internal/domain/clientkey"
@@ -162,9 +164,9 @@ func (s *Service) executeImage(
 		}
 	}()
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
-	attempts := int(s.maxAttempts.Load())
-	if attempts <= 0 {
-		attempts = 3
+	maxAttempts := int(s.maxAttempts.Load())
+	if maxAttempts <= 0 {
+		maxAttempts = 3
 	}
 	excluded := make(map[uint64]bool)
 	var lease *accountLease
@@ -172,9 +174,13 @@ func (s *Service) executeImage(
 	var response *provider.Response
 	var lastCredentialFailure *accountdomain.Credential
 	var lastCredentialError error
-	for attempt := 0; attempt < attempts; attempt++ {
+	egressRetries := 0
+	for attempt := 0; attempt < maxAccountFailoverAttempts; attempt++ {
 		lease, err = s.selector.Acquire(ctx, route.Provider, route.UpstreamModel, quotaMode, "", excluded, false)
 		if err != nil {
+			if response != nil {
+				break
+			}
 			writeFailureAudit(http.StatusServiceUnavailable, "upstream_unavailable", lastCredentialFailure)
 			return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, err)
 		}
@@ -202,10 +208,57 @@ func (s *Service) executeImage(
 			writeFailureAudit(http.StatusBadGateway, errorCode, &credential)
 			return nil, err
 		}
-		if s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden && attempt == 0 && attempt+1 < attempts {
+		if s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden && egressRetries+1 < maxAttempts {
 			_, _ = readRetryableBody(response.Body)
 			lease.Release()
 			delete(excluded, credential.ID)
+			egressRetries++
+			response = nil
+			continue
+		}
+		if response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild {
+			// Free/Unknown Build 图片 403：踢出号池后换号；付费账号模型级问题另议。
+			if lease.Billing == nil || !lease.Billing.IsPaid() {
+				s.excludeUnavailableAccount(ctx, credential, fmt.Sprintf("Grok Build Free account rejected with HTTP %d", response.StatusCode))
+				_, _ = readRetryableBody(response.Body)
+				lease.Release()
+				response = nil
+				continue
+			}
+		}
+		if response.StatusCode == http.StatusUnauthorized {
+			if credential.AuthType == accountdomain.AuthTypeSSO {
+				s.excludeUnavailableAccount(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+				_, _ = readRetryableBody(response.Body)
+				lease.Release()
+				response = nil
+				continue
+			}
+			if s.providers.SupportsCredentialRefresh(credential.Provider) && credential.EncryptedRefreshToken != "" {
+				refreshed, refreshErr := s.accounts.EnsureCredential(ctx, credential, true)
+				if refreshErr == nil {
+					response, err = execute(ctx, route.Provider, refreshed, route.UpstreamModel)
+					credential = refreshed
+					if err == nil && response.StatusCode != http.StatusUnauthorized {
+						break
+					}
+				}
+				if refreshErr != nil && errors.Is(refreshErr, accountapp.ErrCredentialRefreshPermanent) {
+					s.markCredentialRejectedAfterPermanentRefresh(ctx, credential)
+				} else {
+					s.excludeUnavailableAccount(ctx, credential, fmt.Sprintf("%s OAuth force refresh failed after image 401", credential.Provider))
+				}
+				if response != nil {
+					_, _ = readRetryableBody(response.Body)
+				}
+				lease.Release()
+				response = nil
+				continue
+			}
+			s.excludeUnavailableAccount(ctx, credential, fmt.Sprintf("%s credential rejected", credential.Provider))
+			_, _ = readRetryableBody(response.Body)
+			lease.Release()
+			response = nil
 			continue
 		}
 		if quotaKind, _ := s.providers.QuotaKind(credential.Provider); quotaKind == provider.QuotaRemoteWindow && response.StatusCode == http.StatusTooManyRequests && lease.QuotaMode != "" {
@@ -215,11 +268,10 @@ func (s *Service) executeImage(
 			if reconcileErr != nil || !exhausted {
 				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
 			}
-			if attempt+1 < attempts {
-				_, _ = readRetryableBody(response.Body)
-				lease.Release()
-				continue
-			}
+			_, _ = readRetryableBody(response.Body)
+			lease.Release()
+			response = nil
+			continue
 		}
 		break
 	}
@@ -229,10 +281,6 @@ func (s *Service) executeImage(
 			lastCredentialError = ErrNoAvailableAccount
 		}
 		return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, lastCredentialError)
-	}
-	if response.StatusCode == http.StatusUnauthorized && credential.AuthType == accountdomain.AuthTypeSSO {
-		_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
-		s.selector.MarkFailure(ctx, credential, http.StatusUnauthorized, 0)
 	}
 	effectiveQuotaMode := lease.QuotaMode
 	accountID := credential.ID

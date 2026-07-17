@@ -144,6 +144,7 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/accounts/probe-health", h.probeBuildHealth)
 	router.POST("/accounts/batch/refresh-billing", h.batchRefreshBilling)
 	router.POST("/accounts/batch/refresh-quotas", h.batchRefreshQuotas)
+	router.POST("/accounts/batch/delete-by-status", h.batchDeleteByStatus)
 	router.PATCH("/accounts/batch", h.batchUpdate)
 	router.DELETE("/accounts", h.batchDelete)
 	router.PATCH("/accounts/:id", h.update)
@@ -175,6 +176,11 @@ type batchUpdateRequest struct {
 type batchDeleteRequest struct {
 	IDs      []string `json:"ids" binding:"required"`
 	Provider string   `json:"provider" binding:"required"`
+}
+
+type batchDeleteByStatusRequest struct {
+	Provider string `json:"provider" binding:"required"`
+	Status   string `json:"status" binding:"required"`
 }
 
 type buildConversionRequest struct {
@@ -412,6 +418,29 @@ func (h *Handler) batchDelete(c *gin.Context) {
 		return
 	}
 	response.Success(c, http.StatusOK, gin.H{"deleted": deleted})
+}
+
+// batchDeleteByStatus 删除某一 Provider 下指定非可用状态的全部账号。
+func (h *Handler) batchDeleteByStatus(c *gin.Context) {
+	var request batchDeleteByStatusRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	if !accountdomain.Provider(request.Provider).IsValid() {
+		response.Error(c, http.StatusBadRequest, "invalidProvider", "账号来源无效")
+		return
+	}
+	if !accountapp.IsNonAvailableAccountStatus(request.Status) {
+		response.Error(c, http.StatusBadRequest, "invalidStatus", "仅支持删除非可用状态账号")
+		return
+	}
+	deleted, err := h.service.BatchDeleteByStatus(c.Request.Context(), request.Provider, request.Status)
+	if err != nil {
+		h.writeServiceError(c, "accountBatchDeleteByStatusFailed", err, http.StatusInternalServerError, "按状态批量删除账号失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"deleted": deleted, "status": request.Status, "provider": request.Provider})
 }
 
 func (h *Handler) batchRefreshBilling(c *gin.Context) {

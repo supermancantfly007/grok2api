@@ -31,8 +31,11 @@ const (
 )
 
 const (
-	maxHealthProbeAccounts     = 10000
-	healthProbeRequestTimeout  = 20 * time.Second
+	maxHealthProbeAccounts      = 10000
+	healthProbeRequestTimeout   = 20 * time.Second
+	healthProbePaymentCooldown   = 30 * time.Minute
+	healthProbeRateLimitCooldown  = time.Minute
+	healthProbeTransientCooldown  = 30 * time.Second
 )
 
 // HealthProbeItem 单个账号测活结果。
@@ -71,12 +74,17 @@ type HealthProbeObserver func(item HealthProbeItem, completed, total int) error
 
 // ProbeBuildHealth 并发探测全部 Grok Build 账号的上游可用性。
 // 遇 HTTP 401 时会自动强制刷新 OAuth 凭据并复测一次（与网关运行时恢复一致）。
+// 测活结束后会把结果同步到账号状态，使不可用账号立即退出调用池。
 func (s *Service) ProbeBuildHealth(ctx context.Context, observer HealthProbeObserver) (HealthProbeSummary, error) {
 	return s.ProbeBuildHealthWithProgress(ctx, observer, nil)
 }
 
 // ProbeBuildHealthWithProgress 并发探测并报告进度。
-// 对返回 401 且可刷新的账号会写入新 token；刷新后仍 401 会标记 reauthRequired。
+// 对返回 401 且可刷新的账号会写入新 token；最终状态会写回账号：
+//   - healthy：清冷却/失败计数，必要时从 reauthRequired 恢复为 active
+//   - unauthorized / forbidden：reauthRequired，踢出号池
+//   - payment / rate_limited / 5xx：写入冷却，短期内不参与调度
+//   - network / 本地 error：仅记录 lastError，不永久踢出（避免网络抖动误伤号池）
 func (s *Service) ProbeBuildHealthWithProgress(ctx context.Context, observer HealthProbeObserver, progress BatchProgressObserver) (HealthProbeSummary, error) {
 	adapter, err := s.buildProbeAdapter()
 	if err != nil {
@@ -204,15 +212,18 @@ func (s *Service) probeOneBuildAccount(ctx context.Context, adapter buildHealthP
 	started := time.Now()
 	accessToken, err := s.cipher.Decrypt(value.EncryptedAccessToken)
 	if err != nil {
-		item.Status = HealthProbeError
+		// 凭据不可用：按 unauthorized 踢出号池，避免继续被选中。
+		item.Status = HealthProbeUnauthorized
 		item.Error = "读取 access token 失败"
 		item.ElapsedMs = time.Since(started).Milliseconds()
+		s.applyHealthProbeAccountState(ctx, value, item)
 		return item
 	}
 	if strings.TrimSpace(accessToken) == "" {
-		item.Status = HealthProbeError
+		item.Status = HealthProbeUnauthorized
 		item.Error = "access token 为空"
 		item.ElapsedMs = time.Since(started).Milliseconds()
+		s.applyHealthProbeAccountState(ctx, value, item)
 		return item
 	}
 
@@ -228,11 +239,12 @@ func (s *Service) probeOneBuildAccount(ctx context.Context, adapter buildHealthP
 	}
 
 	item.ElapsedMs = time.Since(started).Milliseconds()
+	s.applyHealthProbeAccountState(ctx, value, item)
 	return item
 }
 
 // recoverUnauthorizedBuildProbe 在首次测活 401 后尝试刷新凭据并复测。
-// 刷新成功后若仍 401，标记 reauthRequired 并退出号池。
+// 账号状态写回由 applyHealthProbeAccountState 统一处理。
 func (s *Service) recoverUnauthorizedBuildProbe(ctx context.Context, adapter buildHealthProber, value accountdomain.Credential, item HealthProbeItem) HealthProbeItem {
 	if s.providers == nil || !s.providers.SupportsCredentialRefresh(value.Provider) || strings.TrimSpace(value.EncryptedRefreshToken) == "" {
 		item.Error = "HTTP 401（无可用 refresh token，无法自动重刷）"
@@ -266,10 +278,6 @@ func (s *Service) recoverUnauthorizedBuildProbe(ctx context.Context, adapter bui
 	item.Status, item.Error = classifyHealthProbe(statusCode, err)
 	if item.Status == HealthProbeUnauthorized {
 		item.Error = "HTTP 401（已重刷，上游仍拒绝）"
-		// 刷新后仍被拒说明 refresh token 也已失效，与网关行为一致标记 reauth。
-		if markErr := s.MarkReauthRequired(context.WithoutCancel(ctx), value.ID, "Grok Build OAuth credential rejected after health-probe refresh"); markErr != nil {
-			s.logger.Warn("health_probe_reauth_mark_failed", "account_id", value.ID, "error", markErr)
-		}
 		return item
 	}
 	if item.Status == HealthProbeHealthy {
@@ -280,6 +288,85 @@ func (s *Service) recoverUnauthorizedBuildProbe(ctx context.Context, adapter bui
 		item.Error = "已自动重刷"
 	}
 	return item
+}
+
+// applyHealthProbeAccountState 将测活结果同步到持久化账号状态，供后续选号立即生效。
+func (s *Service) applyHealthProbeAccountState(ctx context.Context, value accountdomain.Credential, item HealthProbeItem) {
+	if s.accounts == nil || value.ID == 0 || item.Status == "" {
+		return
+	}
+	persistCtx := context.WithoutCancel(ctx)
+	reason := healthProbeAccountReason(item)
+	switch item.Status {
+	case HealthProbeHealthy:
+		s.markHealthProbeHealthy(persistCtx, value)
+	case HealthProbeUnauthorized, HealthProbeForbidden:
+		if err := s.MarkReauthRequired(persistCtx, value.ID, reason); err != nil {
+			s.logger.Warn("health_probe_reauth_mark_failed", "account_id", value.ID, "status", item.Status, "error", err)
+		}
+	case HealthProbePayment:
+		s.markHealthProbeCooldown(persistCtx, value, healthProbePaymentCooldown, reason)
+	case HealthProbeRateLimited:
+		s.markHealthProbeCooldown(persistCtx, value, healthProbeRateLimitCooldown, reason)
+	case HealthProbeUnknown:
+		// 5xx 等暂时异常：短冷却，避免立刻再被选中。
+		s.markHealthProbeCooldown(persistCtx, value, healthProbeTransientCooldown, reason)
+	case HealthProbeNetwork, HealthProbeError:
+		// 网络抖动或本地错误：只记 lastError，不踢出号池。
+		if err := s.accounts.UpdateHealth(persistCtx, value.ID, value.FailureCount, value.CooldownUntil, reason, false); err != nil {
+			s.logger.Warn("health_probe_last_error_write_failed", "account_id", value.ID, "status", item.Status, "error", err)
+		}
+	}
+}
+
+func (s *Service) markHealthProbeHealthy(ctx context.Context, value accountdomain.Credential) {
+	if err := s.accounts.UpdateHealth(ctx, value.ID, 0, nil, "", true); err != nil {
+		s.logger.Warn("health_probe_healthy_write_failed", "account_id", value.ID, "error", err)
+	}
+	if value.AuthStatus != accountdomain.AuthStatusReauthRequired {
+		return
+	}
+	// 测活恢复成功：从 reauth 拉回 active，重新进入可用号池。
+	latest, err := s.accounts.Get(ctx, value.ID)
+	if err != nil {
+		s.logger.Warn("health_probe_reactivate_load_failed", "account_id", value.ID, "error", err)
+		return
+	}
+	if latest.AuthStatus != accountdomain.AuthStatusReauthRequired {
+		return
+	}
+	latest.AuthStatus = accountdomain.AuthStatusActive
+	latest.LastError = ""
+	latest.FailureCount = 0
+	latest.CooldownUntil = nil
+	if _, err := s.accounts.Update(ctx, latest); err != nil {
+		s.logger.Warn("health_probe_reactivate_failed", "account_id", value.ID, "error", err)
+	}
+}
+
+func (s *Service) markHealthProbeCooldown(ctx context.Context, value accountdomain.Credential, duration time.Duration, reason string) {
+	if duration <= 0 {
+		duration = healthProbeTransientCooldown
+	}
+	failureCount := value.FailureCount + 1
+	until := s.now().UTC().Add(duration)
+	if err := s.accounts.UpdateHealth(ctx, value.ID, failureCount, &until, reason, false); err != nil {
+		s.logger.Warn("health_probe_cooldown_write_failed", "account_id", value.ID, "error", err)
+		return
+	}
+	if s.sticky != nil {
+		_ = s.sticky.DeleteByAccount(ctx, value.ID)
+	}
+}
+
+func healthProbeAccountReason(item HealthProbeItem) string {
+	if message := strings.TrimSpace(item.Error); message != "" {
+		return truncateProbeError("health probe: " + message)
+	}
+	if item.HTTPStatus > 0 {
+		return fmt.Sprintf("health probe: HTTP %d", item.HTTPStatus)
+	}
+	return "health probe: " + string(item.Status)
 }
 
 func classifyHealthProbe(httpStatus int, err error) (HealthProbeStatus, string) {

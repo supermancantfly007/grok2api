@@ -470,7 +470,7 @@ func TestParseFreeQuotaExhaustion(t *testing.T) {
 	}
 }
 
-func TestGatewayCoolsFreeBuildAccountsAfterForbidden(t *testing.T) {
+func TestGatewayExcludesFreeBuildAccountsAfterForbiddenAndTriesAll(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "systemic-forbidden.db"))
 	if err != nil {
@@ -485,12 +485,13 @@ func TestGatewayCoolsFreeBuildAccountsAfterForbidden(t *testing.T) {
 	auditRepo := relational.NewAuditRepository(database)
 	responseRepo := relational.NewResponseRepository(database)
 	keyRepo := relational.NewClientKeyRepository(database)
-	credentials := make([]account.Credential, 0, 3)
-	for index, name := range []string{"first", "second", "third"} {
+	// 4 个账号 + maxAttempts=2：应试遍全部可用账号，而不是只试 2 次。
+	credentials := make([]account.Credential, 0, 4)
+	for index, name := range []string{"first", "second", "third", "fourth"} {
 		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
 			Provider: account.ProviderBuild, Name: name, SourceKey: name, EncryptedAccessToken: name,
 			ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive,
-			Priority: 300 - index, MaxConcurrent: 1,
+			Priority: 400 - index, MaxConcurrent: 1,
 		})
 		if createErr != nil {
 			t.Fatal(createErr)
@@ -518,7 +519,7 @@ func TestGatewayCoolsFreeBuildAccountsAfterForbidden(t *testing.T) {
 	sticky := memory.NewStickyStore()
 	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
 	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
-	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 2)
 
 	_, err = service.CreateResponse(ctx, Input{
 		RequestID: "req-systemic-403", ClientKey: clientKey, PublicModel: "grok-systemic",
@@ -532,7 +533,7 @@ func TestGatewayCoolsFreeBuildAccountsAfterForbidden(t *testing.T) {
 		t.Fatalf("upstream failure = %#v", upstreamFailure)
 	}
 	attempts := adapter.Attempts()
-	if len(attempts) != 3 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID || attempts[2] != credentials[2].ID {
+	if len(attempts) != 4 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID || attempts[2] != credentials[2].ID || attempts[3] != credentials[3].ID {
 		t.Fatalf("attempts = %#v", attempts)
 	}
 	for _, credential := range credentials {
@@ -540,12 +541,24 @@ func TestGatewayCoolsFreeBuildAccountsAfterForbidden(t *testing.T) {
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
-		if observed.FailureCount != 1 || observed.CooldownUntil == nil || observed.AuthStatus != account.AuthStatusActive {
-			t.Fatalf("account %d was not cooled after 403: %#v", credential.ID, observed)
+		if observed.AuthStatus != account.AuthStatusReauthRequired || observed.LastError == "" {
+			t.Fatalf("account %d was not excluded after 403: %#v", credential.ID, observed)
 		}
 	}
+	// 下一请求不得再选到已踢出的账号（无 active 账号时模型视为不可用）。
+	adapter.resetAttempts()
+	_, err = service.CreateResponse(ctx, Input{
+		RequestID: "req-systemic-403-again", ClientKey: clientKey, PublicModel: "grok-systemic",
+		Body: []byte(`{"model":"grok-systemic","input":"hello again"}`),
+	})
+	if !errors.Is(err, ErrModelNotFound) && !errors.Is(err, ErrNoAvailableAccount) {
+		t.Fatalf("second request error = %v, want model/account unavailable", err)
+	}
+	if attempts := adapter.Attempts(); len(attempts) != 0 {
+		t.Fatalf("excluded accounts were reused: %#v", attempts)
+	}
 	logs, total, err := auditRepo.List(ctx, 0, 10)
-	if err != nil || total != 1 || logs[0].StatusCode != http.StatusForbidden || logs[0].ErrorCode != "upstream_forbidden" || logs[0].AccountID == nil || *logs[0].AccountID != credentials[2].ID {
+	if err != nil || total < 1 || logs[0].StatusCode != http.StatusForbidden || logs[0].ErrorCode != "upstream_forbidden" || logs[0].AccountID == nil || *logs[0].AccountID != credentials[3].ID {
 		t.Fatalf("audit = %#v, total=%d, err=%v", logs, total, err)
 	}
 }
@@ -1221,6 +1234,11 @@ func (a *systemicForbiddenAdapter) Attempts() []uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]uint64(nil), a.attempts...)
+}
+func (a *systemicForbiddenAdapter) resetAttempts() {
+	a.mu.Lock()
+	a.attempts = nil
+	a.mu.Unlock()
 }
 
 type webRateLimitAdapter struct{}
