@@ -22,6 +22,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
 	"github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	inferencedomain "github.com/chenyme/grok2api/backend/internal/domain/inference"
+	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
@@ -91,6 +92,11 @@ type routeResolver interface {
 	GetByProviderUpstream(ctx context.Context, providerValue accountdomain.Provider, upstreamModel string) (modeldomain.Route, error)
 }
 
+// videoAssetReader 从本地媒体层读取已落盘的视频资产。
+type videoAssetReader interface {
+	OpenVideo(ctx context.Context, id string) (mediadomain.Asset, io.ReadCloser, error)
+}
+
 type accountModelSyncer interface {
 	SyncAccount(ctx context.Context, accountID uint64) (int, error)
 }
@@ -106,6 +112,7 @@ type Service struct {
 	responses      repository.ResponseRepository
 	maxAttempts    atomic.Int64
 	mediaJobs      repository.MediaJobRepository
+	mediaAssets    videoAssetReader
 	mediaQueue     chan string
 	mediaMu        sync.Mutex
 	mediaQueued    map[string]struct{}
@@ -132,6 +139,11 @@ func (s *Service) ConfigureMedia(repository repository.MediaJobRepository, concu
 	s.mediaWorker = concurrency
 	s.mediaQueue = make(chan string, min(2048, max(64, concurrency*32)))
 	s.mediaQueued = make(map[string]struct{})
+}
+
+// ConfigureMediaAssets 注入本地视频资产读取能力（可选）。
+func (s *Service) ConfigureMediaAssets(reader videoAssetReader) {
+	s.mediaAssets = reader
 }
 
 func NewService(models routeResolver, audits auditRecorder, accounts *accountapp.Service, clientKeys *clientkeyapp.Service, providers *provider.Registry, selector *Selector, responses repository.ResponseRepository, maxAttempts int) *Service {
@@ -423,15 +435,17 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		}
 		return nil, clientkeyapp.ErrModelNotAllowed
 	}
+	affinityKey := ""
 	if route.Provider == accountdomain.ProviderBuild {
-		input.PromptCacheKey = resolvePromptCacheIdentity(
+		identity := resolveBuildSessionIdentity(
 			input.ClientKey.ID,
 			route.Provider,
 			route.UpstreamModel,
-			operation,
 			input.PromptCacheKey,
 			input.PromptCacheSeed,
 		)
+		input.PromptCacheKey = identity.upstreamID
+		affinityKey = identity.affinityKey
 	}
 	adapter, ok := s.providers.Responses(route.Provider)
 	if !ok {
@@ -485,7 +499,7 @@ attemptLoop:
 		if ownership != nil {
 			lease, err = s.selector.AcquirePinned(ctx, route.Provider, ownership.AccountID, route.UpstreamModel, quotaMode, true)
 		} else {
-			lease, err = s.selector.Acquire(ctx, route.Provider, route.UpstreamModel, quotaMode, input.PromptCacheKey, excluded, !quotaProbeAttempted)
+			lease, err = s.selector.Acquire(ctx, route.Provider, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted)
 		}
 		timing.markSelection(time.Since(selectionStarted))
 		if err != nil {
@@ -609,6 +623,11 @@ attemptLoop:
 				continue
 			}
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			freeBuildForbidden := response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild && (lease.Billing == nil || !lease.Billing.IsPaid())
+			if freeBuildForbidden {
+				// XAI 不接受 Free 账号。主 Build 403 是该账号当前不可用，必须冷却并换号。
+				lastFailure.AccountScoped = true
+			}
 			if response.StatusCode == http.StatusTooManyRequests && response.RateLimit != nil && response.RateLimit.TeamID != "" && response.RateLimit.Model == route.UpstreamModel {
 				limited := s.markTeamModelRateLimit(credential, route.UpstreamModel, *response.RateLimit, time.Now().UTC())
 				lastFailure.AccountScoped = false
@@ -643,7 +662,10 @@ attemptLoop:
 				goto handleResponse
 			}
 			failureHandled := false
-			if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
+			if freeBuildForbidden {
+				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				failureHandled = true
+			} else if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
 				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
 				s.selector.MarkQuotaStateChanged(credential.Provider)
 				failureHandled = reconcileErr == nil && exhausted
@@ -660,8 +682,15 @@ attemptLoop:
 				failureHandled = s.selector.MarkPaidQuotaExhausted(ctx, credential, lease.Billing)
 			}
 			if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.PermanentAccountDenial {
-				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
-				s.selector.MarkQuotaStateChanged(credential.Provider)
+				if credential.Provider == accountdomain.ProviderBuild {
+					// A Build account can lack access to one chat model while its OAuth
+					// credential and video entitlement remain valid. Keep the denial
+					// model-scoped; only an actual credential rejection requires reauth.
+					s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
+				} else {
+					_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
+					s.selector.MarkQuotaStateChanged(credential.Provider)
+				}
 				failureHandled = true
 			} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.CredentialRejected {
 				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s credential rejected", credential.Provider))

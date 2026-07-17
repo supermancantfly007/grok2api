@@ -140,9 +140,13 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	if len(adapter.attempts) != 2 || adapter.attempts[0] != first.ID || adapter.attempts[1] != second.ID {
 		t.Fatalf("attempts = %#v", adapter.attempts)
 	}
-	expectedCacheKey := resolvePromptCacheIdentity(clientKey.ID, account.ProviderBuild, "grok-test", audit.OperationResponses, "", "claude-session")
+	identity := resolveBuildSessionIdentity(clientKey.ID, account.ProviderBuild, "grok-test", "", "claude-session")
+	expectedCacheKey := identity.upstreamID
 	if adapter.lastPromptCacheKey != expectedCacheKey {
 		t.Fatalf("prompt cache key = %q, want %q", adapter.lastPromptCacheKey, expectedCacheKey)
+	}
+	if boundID, ok, err := sticky.Get(ctx, stickySessionKey(identity.affinityKey), time.Now().UTC()); err != nil || !ok || boundID != second.ID {
+		t.Fatalf("failover sticky binding = %d, %v, err = %v; want account %d", boundID, ok, err, second.ID)
 	}
 	observedAccount, err := accountRepo.Get(ctx, second.ID)
 	if err != nil || observedAccount.ObservedModel != "grok-test-build-free" {
@@ -466,7 +470,7 @@ func TestParseFreeQuotaExhaustion(t *testing.T) {
 	}
 }
 
-func TestGatewayPreservesRepeatedSystemicForbiddenWithoutCoolingAccounts(t *testing.T) {
+func TestGatewayCoolsFreeBuildAccountsAfterForbidden(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "systemic-forbidden.db"))
 	if err != nil {
@@ -524,11 +528,11 @@ func TestGatewayPreservesRepeatedSystemicForbiddenWithoutCoolingAccounts(t *test
 	if !errors.As(err, &upstreamFailure) || errors.Is(err, ErrNoAvailableAccount) {
 		t.Fatalf("error = %T %v", err, err)
 	}
-	if upstreamFailure.HTTPStatus != http.StatusForbidden || upstreamFailure.Code != "upstream_forbidden" || upstreamFailure.AccountScoped {
+	if upstreamFailure.HTTPStatus != http.StatusForbidden || upstreamFailure.Code != "upstream_forbidden" || !upstreamFailure.AccountScoped {
 		t.Fatalf("upstream failure = %#v", upstreamFailure)
 	}
 	attempts := adapter.Attempts()
-	if len(attempts) != 2 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID {
+	if len(attempts) != 3 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID || attempts[2] != credentials[2].ID {
 		t.Fatalf("attempts = %#v", attempts)
 	}
 	for _, credential := range credentials {
@@ -536,12 +540,12 @@ func TestGatewayPreservesRepeatedSystemicForbiddenWithoutCoolingAccounts(t *test
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
-		if observed.FailureCount != 0 || observed.CooldownUntil != nil || observed.AuthStatus != account.AuthStatusActive {
-			t.Fatalf("account %d was incorrectly penalized: %#v", credential.ID, observed)
+		if observed.FailureCount != 1 || observed.CooldownUntil == nil || observed.AuthStatus != account.AuthStatusActive {
+			t.Fatalf("account %d was not cooled after 403: %#v", credential.ID, observed)
 		}
 	}
 	logs, total, err := auditRepo.List(ctx, 0, 10)
-	if err != nil || total != 1 || logs[0].StatusCode != http.StatusForbidden || logs[0].ErrorCode != "upstream_forbidden" || logs[0].AccountID == nil || *logs[0].AccountID != credentials[1].ID {
+	if err != nil || total != 1 || logs[0].StatusCode != http.StatusForbidden || logs[0].ErrorCode != "upstream_forbidden" || logs[0].AccountID == nil || *logs[0].AccountID != credentials[2].ID {
 		t.Fatalf("audit = %#v, total=%d, err=%v", logs, total, err)
 	}
 }
@@ -628,6 +632,75 @@ func TestGatewayRefreshesAndRetriesBuildPermissionDenialOnce(t *testing.T) {
 	}
 	if rejected.AuthStatus != account.AuthStatusReauthRequired || adapter.refreshes.Load() != 1 {
 		t.Fatalf("rejected credential = %#v, refreshes = %d", rejected, adapter.refreshes.Load())
+	}
+}
+
+func TestBuildChatPermissionDenialDoesNotInvalidateVideoCredential(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "model-scoped-denial.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	credential, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "chat-denied-video-valid", SourceKey: "chat-denied-video-valid",
+		EncryptedAccessToken: "access-old", EncryptedRefreshToken: "refresh-old", ExpiresAt: time.Now().Add(time.Hour),
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := accountRepo.SaveBilling(ctx, account.Billing{AccountID: credential.ID, MonthlyLimit: 140, SyncedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderBuild, []string{"grok-chat-denied"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-chat-denied"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "chat-denied-key", Prefix: "chat-denied", SecretHash: strings.Repeat("c", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &authRescueAdapter{}
+	adapter.denyChat.Store(true)
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 2)
+
+	if _, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-chat-denied", ClientKey: clientKey, PublicModel: "grok-chat-denied",
+		Body: []byte(`{"model":"grok-chat-denied","input":"hello"}`),
+	}); err == nil {
+		t.Fatal("chat permission denial unexpectedly succeeded")
+	}
+	updated, err := accountRepo.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.AuthStatus != account.AuthStatusActive || updated.FailureCount != 0 || updated.CooldownUntil != nil {
+		t.Fatalf("chat denial invalidated the whole credential: %#v", updated)
+	}
+	candidates, err := accountRepo.ListRoutingCandidates(ctx, account.ProviderBuild, "grok-chat-denied", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].ModelQuotaBlock == nil || candidates[0].ModelQuotaBlock.Reason != "model_access_denied" {
+		t.Fatalf("model-scoped denial was not persisted: %#v", candidates)
 	}
 }
 
@@ -754,7 +827,7 @@ func TestImageStreamPropagatesWithoutTouchingChatQuota(t *testing.T) {
 
 	result, err := service.GenerateImage(ctx, ImageGenerationInput{
 		RequestID: "req-image-stream", ClientKey: key, PublicModel: "grok-imagine-image-quality",
-		Prompt: "test", Count: 2, Resolution: "1k", ResponseFormat: "url", Streaming: true,
+		Prompt: "test", Count: 1, Resolution: "1k", ResponseFormat: "url", Streaming: true, PartialImages: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -766,8 +839,8 @@ func TestImageStreamPropagatesWithoutTouchingChatQuota(t *testing.T) {
 	if string(body) != "event: image_generation.completed\ndata: {}\n\ndata: [DONE]\n\n" {
 		t.Fatalf("stream body = %q", body)
 	}
-	if !adapter.Streaming() {
-		t.Fatal("stream flag was not propagated to the Web image adapter")
+	if !adapter.Streaming() || adapter.PartialImages() != 1 {
+		t.Fatalf("image stream options were not propagated: streaming=%t partial_images=%d", adapter.Streaming(), adapter.PartialImages())
 	}
 	if logs, total, err := auditRepo.List(ctx, 0, 10); err != nil || total != 0 || len(logs) != 0 {
 		t.Fatalf("audit persisted before finalization: logs=%#v total=%d err=%v", logs, total, err)
@@ -780,8 +853,8 @@ func TestImageStreamPropagatesWithoutTouchingChatQuota(t *testing.T) {
 		t.Fatalf("audit logs=%#v total=%d err=%v", logs, total, err)
 	}
 	if !logs[0].Streaming || logs[0].Operation != "image" || logs[0].Provider != string(account.ProviderWeb) || logs[0].ErrorCode != "" ||
-		logs[0].MediaInputImages != 0 || logs[0].MediaOutputImages != 2 ||
-		logs[0].PricingModel != "grok-imagine-image-quality-1k" || logs[0].EstimatedCostInUSDTicks != 1_000_000_000 {
+		logs[0].MediaInputImages != 0 || logs[0].MediaOutputImages != 1 ||
+		logs[0].PricingModel != "grok-imagine-image-quality-1k" || logs[0].EstimatedCostInUSDTicks != 500_000_000 {
 		t.Fatalf("audit = %#v", logs[0])
 	}
 	windows, err := accountRepo.GetQuotaWindows(ctx, []uint64{credential.ID})
@@ -849,7 +922,8 @@ func TestImageStreamPropagatesWithoutTouchingChatQuota(t *testing.T) {
 	editResult, err := service.EditImage(ctx, ImageEditInput{
 		RequestID: "req-image-edit", ClientKey: key, PublicModel: "grok-imagine-image-edit",
 		Prompt: "edit", ImageURLs: []string{"data:image/png;base64,a", "data:image/png;base64,b"},
-		Count: 3, Resolution: "2k", ResponseFormat: "url",
+		Count: 3, Size: "1024x1024", AspectRatio: "1:1", Resolution: "2k", ResponseFormat: "url",
+		Streaming: true, PartialImages: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -861,8 +935,9 @@ func TestImageStreamPropagatesWithoutTouchingChatQuota(t *testing.T) {
 	if err != nil || total != 4 || logs[0].RequestID != "req-image-edit" || logs[0].MediaInputImages != 2 || logs[0].MediaOutputImages != 3 || logs[0].PricingModel != "grok-imagine-image-edit-2k" || logs[0].EstimatedCostInUSDTicks != 2_300_000_000 {
 		t.Fatalf("image edit pricing audit = %#v, total=%d, err=%v", logs, total, err)
 	}
-	if adapter.EditResolution() != "2k" {
-		t.Fatalf("image edit resolution = %q", adapter.EditResolution())
+	editRequest := adapter.EditRequest()
+	if editRequest.Resolution != "2k" || editRequest.Size != "1024x1024" || editRequest.AspectRatio != "1:1" || !editRequest.Streaming || editRequest.PartialImages != 2 {
+		t.Fatalf("image edit request = %#v", editRequest)
 	}
 
 	billingBeforeFailure, err := keyRepo.Get(ctx, key.ID)
@@ -1095,6 +1170,7 @@ type authRescueAdapter struct {
 	attempts  atomic.Int64
 	refreshes atomic.Int64
 	rejectAll atomic.Bool
+	denyChat  atomic.Bool
 }
 
 func (a *authRescueAdapter) Provider() account.Provider { return account.ProviderBuild }
@@ -1103,6 +1179,12 @@ func (a *authRescueAdapter) Definition() provider.Definition {
 }
 func (a *authRescueAdapter) ForwardResponse(_ context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
 	a.attempts.Add(1)
+	if a.denyChat.Load() {
+		return &provider.Response{
+			StatusCode: http.StatusForbidden, Status: "403 Forbidden", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"error":{"code":"permission_denied","message":"Access to the chat endpoint is denied"}}`)),
+		}, nil
+	}
 	if a.rejectAll.Load() {
 		return &provider.Response{
 			StatusCode: http.StatusUnauthorized, Status: "401 Unauthorized", Header: make(http.Header),
@@ -1144,12 +1226,13 @@ func (a *systemicForbiddenAdapter) Attempts() []uint64 {
 type webRateLimitAdapter struct{}
 
 type webImageStreamAdapter struct {
-	mu             sync.Mutex
-	streaming      bool
-	editResolution string
-	synced         chan string
-	failureEgress  *infraegress.Manager
-	attempts       []uint64
+	mu            sync.Mutex
+	streaming     bool
+	partialImages int
+	editRequest   provider.ImageEditRequest
+	synced        chan string
+	failureEgress *infraegress.Manager
+	attempts      []uint64
 }
 
 type webChatQuotaAdapter struct {
@@ -1209,6 +1292,7 @@ func (a *webImageStreamAdapter) TierOrder(string) []account.WebTier {
 func (a *webImageStreamAdapter) GenerateImage(ctx context.Context, request provider.ImageGenerationRequest) (*provider.Response, error) {
 	a.mu.Lock()
 	a.streaming = request.Streaming
+	a.partialImages = request.PartialImages
 	failureEgress := a.failureEgress
 	a.attempts = append(a.attempts, request.Credential.ID)
 	a.mu.Unlock()
@@ -1231,7 +1315,7 @@ func (a *webImageStreamAdapter) ForwardResponse(context.Context, provider.Respon
 }
 func (a *webImageStreamAdapter) EditImage(_ context.Context, request provider.ImageEditRequest) (*provider.Response, error) {
 	a.mu.Lock()
-	a.editResolution = request.Resolution
+	a.editRequest = request
 	a.mu.Unlock()
 	return &provider.Response{
 		StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{"Content-Type": {"application/json"}},
@@ -1243,10 +1327,15 @@ func (a *webImageStreamAdapter) Streaming() bool {
 	defer a.mu.Unlock()
 	return a.streaming
 }
-func (a *webImageStreamAdapter) EditResolution() string {
+func (a *webImageStreamAdapter) PartialImages() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.editResolution
+	return a.partialImages
+}
+func (a *webImageStreamAdapter) EditRequest() provider.ImageEditRequest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.editRequest
 }
 func (a *webImageStreamAdapter) FailWithEgress(manager *infraegress.Manager) {
 	a.mu.Lock()

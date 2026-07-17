@@ -21,6 +21,7 @@ var (
 // ProviderBuildConfig 是管理接口使用的 Provider 可编辑输入。
 type ProviderBuildConfig struct {
 	BaseURL          string
+	FallbackBaseURL  string
 	ClientVersion    string
 	ClientIdentifier string
 	TokenAuth        string
@@ -51,7 +52,6 @@ type ProviderWebConfig struct {
 
 type ProviderConsoleConfig struct {
 	BaseURL     string
-	UserAgent   string
 	ChatTimeout string
 }
 
@@ -83,11 +83,12 @@ type FrontendConfig struct {
 
 // RoutingConfig 是管理接口使用的路由可编辑输入。
 type RoutingConfig struct {
-	StickyTTL    string
-	CooldownBase string
-	CooldownMax  string
-	CapacityWait string
-	MaxAttempts  int
+	StickyTTL       string
+	CooldownBase    string
+	CooldownMax     string
+	CapacityWait    string
+	MaxAttempts     int
+	PreferFreeBuild bool
 }
 
 // AuditConfig 是管理接口使用的审计可编辑输入。
@@ -260,9 +261,9 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		capacityWait = base.Routing.CapacityWait.Value()
 	}
 	base.Provider.Build = config.BuildProviderConfig{
-		BaseURL: value.ProviderBuild.BaseURL, ClientVersion: value.ProviderBuild.ClientVersion,
-		ClientIdentifier: value.ProviderBuild.ClientIdentifier, TokenAuth: value.ProviderBuild.TokenAuth,
-		UserAgent: value.ProviderBuild.UserAgent,
+		BaseURL: value.ProviderBuild.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(value.ProviderBuild.FallbackBaseURL),
+		ClientVersion: value.ProviderBuild.ClientVersion, ClientIdentifier: value.ProviderBuild.ClientIdentifier,
+		TokenAuth: value.ProviderBuild.TokenAuth, UserAgent: value.ProviderBuild.UserAgent,
 	}
 	base.Provider.Web = config.WebProviderConfig{
 		BaseURL: value.ProviderWeb.BaseURL, QuotaTimeout: config.Duration(value.ProviderWeb.QuotaTimeout),
@@ -275,8 +276,7 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	// Console 是后续版本新增的完整配置段；旧 JSON 整段缺失时沿用代码默认值。
 	if value.ProviderConsole != (settingsdomain.ProviderConsoleConfig{}) {
 		base.Provider.Console = config.ConsoleProviderConfig{
-			BaseURL: value.ProviderConsole.BaseURL, UserAgent: value.ProviderConsole.UserAgent,
-			ChatTimeout: config.Duration(value.ProviderConsole.ChatTimeout),
+			BaseURL: value.ProviderConsole.BaseURL, ChatTimeout: config.Duration(value.ProviderConsole.ChatTimeout),
 		}
 	}
 	randomDelay := time.Duration(-1)
@@ -296,6 +296,7 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	base.Routing = config.RoutingConfig{
 		StickyTTL: config.Duration(value.Routing.StickyTTL), CooldownBase: config.Duration(value.Routing.CooldownBase),
 		CooldownMax: config.Duration(value.Routing.CooldownMax), CapacityWait: config.Duration(capacityWait), MaxAttempts: value.Routing.MaxAttempts,
+		PreferFreeBuild: value.Routing.PreferFreeBuild,
 	}
 	base.Audit = config.AuditConfig{
 		BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: config.Duration(value.Audit.FlushInterval),
@@ -311,9 +312,9 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 	return settingsdomain.Config{
 		Server: settingsdomain.ServerConfig{MaxConcurrentRequests: value.Server.MaxConcurrentRequests},
 		ProviderBuild: settingsdomain.ProviderBuildConfig{
-			BaseURL: value.Provider.Build.BaseURL, ClientVersion: value.Provider.Build.ClientVersion,
-			ClientIdentifier: value.Provider.Build.ClientIdentifier, TokenAuth: value.Provider.Build.TokenAuth,
-			UserAgent: value.Provider.Build.UserAgent,
+			BaseURL: value.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(value.Provider.Build.FallbackBaseURL),
+			ClientVersion: value.Provider.Build.ClientVersion, ClientIdentifier: value.Provider.Build.ClientIdentifier,
+			TokenAuth: value.Provider.Build.TokenAuth, UserAgent: value.Provider.Build.UserAgent,
 		},
 		ProviderWeb: settingsdomain.ProviderWebConfig{
 			BaseURL: value.Provider.Web.BaseURL, QuotaTimeout: value.Provider.Web.QuotaTimeout.Value(),
@@ -325,8 +326,7 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			RecoveryBackoffBase: value.Provider.Web.RecoveryBackoffBase.Value(), RecoveryBackoffMax: value.Provider.Web.RecoveryBackoffMax.Value(),
 		},
 		ProviderConsole: settingsdomain.ProviderConsoleConfig{
-			BaseURL: value.Provider.Console.BaseURL, UserAgent: value.Provider.Console.UserAgent,
-			ChatTimeout: value.Provider.Console.ChatTimeout.Value(),
+			BaseURL: value.Provider.Console.BaseURL, ChatTimeout: value.Provider.Console.ChatTimeout.Value(),
 		},
 		Batch: settingsdomain.BatchConfig{
 			ImportConcurrency: value.Batch.ImportConcurrency, ConversionConcurrency: value.Batch.ConversionConcurrency,
@@ -343,6 +343,7 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 		Routing: settingsdomain.RoutingConfig{
 			StickyTTL: value.Routing.StickyTTL.Value(), CooldownBase: value.Routing.CooldownBase.Value(),
 			CooldownMax: value.Routing.CooldownMax.Value(), CapacityWait: value.Routing.CapacityWait.Value(), MaxAttempts: value.Routing.MaxAttempts,
+			PreferFreeBuild: value.Routing.PreferFreeBuild,
 		},
 		Audit: settingsdomain.AuditConfig{
 			BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: value.Audit.FlushInterval.Value(),
@@ -375,6 +376,7 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next := current
 	next.Server.MaxConcurrentRequests = input.Server.MaxConcurrentRequests
 	next.Provider.Build.BaseURL = strings.TrimSpace(input.ProviderBuild.BaseURL)
+	next.Provider.Build.FallbackBaseURL = config.NormalizeBuildFallbackBaseURL(input.ProviderBuild.FallbackBaseURL)
 	next.Provider.Build.ClientVersion = strings.TrimSpace(input.ProviderBuild.ClientVersion)
 	next.Provider.Build.ClientIdentifier = strings.TrimSpace(input.ProviderBuild.ClientIdentifier)
 	if tokenAuth := strings.TrimSpace(input.ProviderBuild.TokenAuth); tokenAuth != "" {
@@ -394,7 +396,6 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.Provider.Web.MediaConcurrency = input.ProviderWeb.MediaConcurrency
 	next.Provider.Web.AllowNSFW = input.ProviderWeb.AllowNSFW
 	next.Provider.Console.BaseURL = strings.TrimSpace(input.ProviderConsole.BaseURL)
-	next.Provider.Console.UserAgent = strings.TrimSpace(input.ProviderConsole.UserAgent)
 	next.Batch = config.BatchConfig{
 		ImportConcurrency: input.Batch.ImportConcurrency, ConversionConcurrency: input.Batch.ConversionConcurrency,
 		SyncConcurrency: input.Batch.SyncConcurrency, RefreshConcurrency: input.Batch.RefreshConcurrency,
@@ -404,6 +405,7 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.Media.CleanupThresholdPercent = input.Media.CleanupThresholdPercent
 	next.Frontend.PublicAPIBaseURLOverride = strings.TrimSpace(input.Frontend.PublicAPIBaseURL)
 	next.Routing.MaxAttempts = input.Routing.MaxAttempts
+	next.Routing.PreferFreeBuild = input.Routing.PreferFreeBuild
 	next.Audit.BufferSize = input.Audit.BufferSize
 	next.Audit.BatchSize = input.Audit.BatchSize
 	next.ClientKeyDefaults.RPMLimit = input.ClientKeyDefaults.RPMLimit
@@ -446,9 +448,9 @@ func toEditable(cfg config.Config) EditableConfig {
 	return EditableConfig{
 		Server: ServerConfig{MaxConcurrentRequests: cfg.Server.MaxConcurrentRequests},
 		ProviderBuild: ProviderBuildConfig{
-			BaseURL: cfg.Provider.Build.BaseURL, ClientVersion: cfg.Provider.Build.ClientVersion,
-			ClientIdentifier: cfg.Provider.Build.ClientIdentifier, TokenAuth: cfg.Provider.Build.TokenAuth,
-			UserAgent: cfg.Provider.Build.UserAgent,
+			BaseURL: cfg.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(cfg.Provider.Build.FallbackBaseURL),
+			ClientVersion: cfg.Provider.Build.ClientVersion, ClientIdentifier: cfg.Provider.Build.ClientIdentifier,
+			TokenAuth: cfg.Provider.Build.TokenAuth, UserAgent: cfg.Provider.Build.UserAgent,
 		},
 		ProviderWeb: ProviderWebConfig{
 			BaseURL: cfg.Provider.Web.BaseURL, QuotaTimeout: cfg.Provider.Web.QuotaTimeout.String(),
@@ -460,8 +462,7 @@ func toEditable(cfg config.Config) EditableConfig {
 			RecoveryBackoffBase: cfg.Provider.Web.RecoveryBackoffBase.String(), RecoveryBackoffMax: cfg.Provider.Web.RecoveryBackoffMax.String(),
 		},
 		ProviderConsole: ProviderConsoleConfig{
-			BaseURL: cfg.Provider.Console.BaseURL, UserAgent: cfg.Provider.Console.UserAgent,
-			ChatTimeout: cfg.Provider.Console.ChatTimeout.String(),
+			BaseURL: cfg.Provider.Console.BaseURL, ChatTimeout: cfg.Provider.Console.ChatTimeout.String(),
 		},
 		Batch: BatchConfig{
 			ImportConcurrency: cfg.Batch.ImportConcurrency, ConversionConcurrency: cfg.Batch.ConversionConcurrency,
@@ -478,6 +479,7 @@ func toEditable(cfg config.Config) EditableConfig {
 		Routing: RoutingConfig{
 			StickyTTL: cfg.Routing.StickyTTL.String(), CooldownBase: cfg.Routing.CooldownBase.String(),
 			CooldownMax: cfg.Routing.CooldownMax.String(), CapacityWait: cfg.Routing.CapacityWait.String(), MaxAttempts: cfg.Routing.MaxAttempts,
+			PreferFreeBuild: cfg.Routing.PreferFreeBuild,
 		},
 		Audit: AuditConfig{
 			BufferSize: cfg.Audit.BufferSize, BatchSize: cfg.Audit.BatchSize, FlushInterval: cfg.Audit.FlushInterval.String(),

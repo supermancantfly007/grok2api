@@ -219,6 +219,7 @@ type ImageGenerationRequest struct {
 	Resolution     string
 	ResponseFormat string
 	Streaming      bool
+	PartialImages  int
 }
 
 type ImageInput struct {
@@ -233,12 +234,18 @@ type ImageEditRequest struct {
 	Prompt         string
 	ImageURLs      []string
 	Count          int
+	Size           string
+	AspectRatio    string
 	Resolution     string
 	ResponseFormat string
+	Streaming      bool
+	PartialImages  int
 }
 
 type VideoRequest struct {
-	Credential    account.Credential
+	Credential account.Credential
+	// JobID 绑定本地视频任务，供 XAI ZDR 上传票据与结果资产关联。
+	JobID         string
 	Prompt        string
 	Duration      int
 	AspectRatio   string
@@ -250,6 +257,8 @@ type VideoRequest struct {
 type VideoResult struct {
 	URL         string
 	ContentType string
+	// AssetID 非空时表示结果已写入本地媒体资产，内容读取应走 MediaObjectStorage。
+	AssetID string
 }
 
 // RefreshedCredential 表示 OAuth 刷新后的旋转凭据。
@@ -272,6 +281,13 @@ type ResponseAdapter interface {
 type ModelCatalogAdapter interface {
 	Adapter
 	ListModels(ctx context.Context, credential account.Credential) ([]string, error)
+}
+
+// AccountModelCapabilityNormalizer 可选：按 Billing 快照归一化账号模型能力。
+// 未实现时模型同步原样写入上游目录；billing 为 nil 表示 Unknown（无快照）。
+type AccountModelCapabilityNormalizer interface {
+	Adapter
+	NormalizeAccountModelCapabilities(models []string, billing *account.Billing) []string
 }
 
 type BillingAdapter interface {
@@ -328,6 +344,13 @@ type ImageAssetStore interface {
 type VideoAdapter interface {
 	Adapter
 	GenerateVideo(ctx context.Context, request VideoRequest) (VideoResult, error)
+}
+
+// VideoContentDownloader streams a completed provider video using the
+// credential that created the job. Callers must enforce job ownership first.
+type VideoContentDownloader interface {
+	VideoAdapter
+	DownloadVideo(ctx context.Context, credential account.Credential, rawURL string) (io.ReadCloser, string, int64, error)
 }
 
 type RoutingMetadataAdapter interface {

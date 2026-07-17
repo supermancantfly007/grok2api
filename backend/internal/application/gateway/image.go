@@ -27,6 +27,7 @@ type ImageGenerationInput struct {
 	Resolution     string
 	ResponseFormat string
 	Streaming      bool
+	PartialImages  int
 }
 
 // ImageEditInput 表示图片编辑用例已经完成协议校验后的输入。
@@ -37,8 +38,12 @@ type ImageEditInput struct {
 	Prompt         string
 	ImageURLs      []string
 	Count          int
+	Size           string
+	AspectRatio    string
 	Resolution     string
 	ResponseFormat string
+	Streaming      bool
+	PartialImages  int
 }
 
 type imageProviderSupport func(accountdomain.Provider) bool
@@ -58,7 +63,7 @@ func (s *Service) GenerateImage(ctx context.Context, input ImageGenerationInput)
 		return adapter.GenerateImage(executionCtx, provider.ImageGenerationRequest{
 			Credential: credential, Model: upstream, Prompt: input.Prompt, Count: input.Count,
 			Size: input.Size, AspectRatio: input.AspectRatio, Resolution: input.Resolution,
-			ResponseFormat: input.ResponseFormat, Streaming: input.Streaming,
+			ResponseFormat: input.ResponseFormat, Streaming: input.Streaming, PartialImages: input.PartialImages,
 		})
 	}, input.Streaming, input.Resolution, input.Count, 0)
 }
@@ -75,9 +80,11 @@ func (s *Service) EditImage(ctx context.Context, input ImageEditInput) (*Result,
 		}
 		return adapter.EditImage(executionCtx, provider.ImageEditRequest{
 			Credential: credential, Model: upstream, Prompt: input.Prompt,
-			ImageURLs: input.ImageURLs, Count: input.Count, Resolution: input.Resolution, ResponseFormat: input.ResponseFormat,
+			ImageURLs: input.ImageURLs, Count: input.Count, Size: input.Size, AspectRatio: input.AspectRatio,
+			Resolution: input.Resolution, ResponseFormat: input.ResponseFormat,
+			Streaming: input.Streaming, PartialImages: input.PartialImages,
 		})
-	}, false, input.Resolution, input.Count, len(input.ImageURLs))
+	}, input.Streaming, input.Resolution, input.Count, len(input.ImageURLs))
 }
 
 func (s *Service) executeImage(

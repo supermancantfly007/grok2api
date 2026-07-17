@@ -89,6 +89,7 @@ export function SettingsPage() {
           >
             <div className="grid gap-x-4 gap-y-5 sm:grid-cols-2">
               <SettingsField controlId="provider-base-url" className="sm:col-span-2" label={t("settings.provider.baseURL")} error={form.formState.errors.providerBuild?.baseURL?.message}><Input id="provider-base-url" {...form.register("providerBuild.baseURL")} /></SettingsField>
+              <SettingsField controlId="provider-fallback-base-url" className="sm:col-span-2" label={t("settings.provider.fallbackBaseURL")} error={form.formState.errors.providerBuild?.fallbackBaseURL?.message}><Input id="provider-fallback-base-url" {...form.register("providerBuild.fallbackBaseURL")} /></SettingsField>
               <SettingsField controlId="provider-client-version" label={t("settings.provider.clientVersion")} badge={t("settings.provider.recommendedVersion", { version: recommendedBuild?.clientVersion ?? "-" })} error={form.formState.errors.providerBuild?.clientVersion?.message}><Input id="provider-client-version" {...form.register("providerBuild.clientVersion")} /></SettingsField>
               <SettingsField controlId="provider-client-identifier" label={t("settings.provider.clientIdentifier")} error={form.formState.errors.providerBuild?.clientIdentifier?.message}><Input id="provider-client-identifier" {...form.register("providerBuild.clientIdentifier")} /></SettingsField>
               <SettingsField controlId="provider-token-auth" label={t("settings.provider.tokenAuth")} badge={form.watch("providerBuild.tokenAuthConfigured") ? t("settings.web.statsigConfigured") : undefined} error={form.formState.errors.providerBuild?.tokenAuth?.message}><Input id="provider-token-auth" type="password" autoComplete="off" placeholder={form.watch("providerBuild.tokenAuthConfigured") ? t("settings.web.statsigKeepConfigured") : undefined} {...form.register("providerBuild.tokenAuth")} /></SettingsField>
@@ -130,7 +131,6 @@ export function SettingsPage() {
           <SettingsSection title={t("console.name")}>
             <div className="grid gap-x-4 gap-y-5 sm:grid-cols-2">
               <SettingsField controlId="console-base-url" className="sm:col-span-2" label={t("console.baseURL")} error={form.formState.errors.providerConsole?.baseURL?.message}><Input id="console-base-url" type="url" {...form.register("providerConsole.baseURL")} /></SettingsField>
-              <SettingsField controlId="console-user-agent" className="sm:col-span-2" label={t("console.userAgent")} error={form.formState.errors.providerConsole?.userAgent?.message}><Input id="console-user-agent" {...form.register("providerConsole.userAgent")} /></SettingsField>
               <SettingsField controlId="console-chat-timeout" label={t("console.chatTimeout")} error={form.formState.errors.providerConsole?.chatTimeout?.message}><Controller control={form.control} name="providerConsole.chatTimeout" render={({ field }) => <DurationInput id="console-chat-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
             </div>
           </SettingsSection>
@@ -191,6 +191,7 @@ export function SettingsPage() {
               <SettingsField controlId="routing-cooldown-max" label={t("settings.routing.cooldownMax")} error={form.formState.errors.routing?.cooldownMax?.message}><Controller control={form.control} name="routing.cooldownMax" render={({ field }) => <DurationInput id="routing-cooldown-max" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="routing-capacity-wait" label={t("settings.routing.capacityWait", { defaultValue: "Saturated account wait" })} error={form.formState.errors.routing?.capacityWait?.message}><Controller control={form.control} name="routing.capacityWait" render={({ field }) => <DurationInput id="routing-capacity-wait" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="routing-max-attempts" label={t("settings.routing.maxAttempts")} error={form.formState.errors.routing?.maxAttempts?.message}><Input id="routing-max-attempts" type="number" min={1} max={10} {...form.register("routing.maxAttempts", { valueAsNumber: true })} /></SettingsField>
+              <SettingsField controlId="routing-prefer-free-build" label={t("settings.routing.preferFreeBuild")}><Controller control={form.control} name="routing.preferFreeBuild" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-prefer-free-build" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
             </div>
           </SettingsSection>
 

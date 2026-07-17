@@ -90,7 +90,7 @@ func TestForwardResponseMatchesGrokBuildHeadersAndPreservesReasoning(t *testing.
 	}
 	_ = response.Body.Close()
 	input := captured["input"].([]any)
-	if captured["model"] != "grok-4.5" || captured["prompt_cache_key"] != "isolated-key" || len(input) != 1 || input[0].(map[string]any)["encrypted_content"] != "cipher" {
+	if captured["model"] != "grok-4.5" || captured["prompt_cache_key"] != "isolated-key" || len(input) != 1 || input[0].(map[string]any)["type"] != "reasoning" || input[0].(map[string]any)["encrypted_content"] != "cipher" {
 		t.Fatalf("captured = %#v", captured)
 	}
 }
@@ -203,6 +203,38 @@ func TestGetBillingUsesCreditsEndpointOnce(t *testing.T) {
 	}
 	if calls != 1 || billing.AccountID != 7 || billing.CreditUsagePercent != 25 || billing.UsagePeriodType != "USAGE_PERIOD_TYPE_WEEKLY" || billing.SyncedAt.IsZero() {
 		t.Fatalf("calls=%d billing=%#v", calls, billing)
+	}
+}
+
+func TestNormalizeAccountModelCapabilitiesSuperAddsVideo15(t *testing.T) {
+	adapter := &Adapter{}
+	// Super / paid：主 Build 仅返回 grok-4.5 时也必须补齐 1.5。
+	got := adapter.NormalizeAccountModelCapabilities([]string{"grok-4.5", "  ", "grok-4.5"}, &account.Billing{MonthlyLimit: 100})
+	if len(got) != 2 || got[0] != "grok-4.5" || got[1] != buildVideoModel {
+		t.Fatalf("super primary catalog = %#v", got)
+	}
+	// Super + fallback 目录已含 1.5：幂等去重，其它模型不变。
+	got = adapter.NormalizeAccountModelCapabilities(
+		[]string{"grok-4.5", buildVideoModel, "grok-code-fast-1", buildVideoModel},
+		&account.Billing{OnDemandCap: 10},
+	)
+	if len(got) != 3 || got[0] != "grok-4.5" || got[1] != buildVideoModel || got[2] != "grok-code-fast-1" {
+		t.Fatalf("super fallback catalog = %#v", got)
+	}
+	// Free：即使目录暴露 1.5 也必须移除。
+	got = adapter.NormalizeAccountModelCapabilities([]string{"grok-4.5", buildVideoModel}, &account.Billing{Used: 1, PlanName: "free"})
+	if len(got) != 1 || got[0] != "grok-4.5" {
+		t.Fatalf("free catalog = %#v", got)
+	}
+	// Unknown（无 Billing）：与 Free 相同，移除 1.5。
+	got = adapter.NormalizeAccountModelCapabilities([]string{buildVideoModel, "grok-4.5"}, nil)
+	if len(got) != 1 || got[0] != "grok-4.5" {
+		t.Fatalf("unknown catalog = %#v", got)
+	}
+	// 不得依赖 BuildAPIFallback；空目录 + Super 仅补 1.5。
+	got = adapter.NormalizeAccountModelCapabilities(nil, &account.Billing{CreditUsagePercent: 1})
+	if len(got) != 1 || got[0] != buildVideoModel {
+		t.Fatalf("super empty catalog = %#v", got)
 	}
 }
 

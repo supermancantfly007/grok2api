@@ -73,32 +73,40 @@ type chatMessage struct {
 }
 
 type normalizedChatInput struct {
-	Prompt string
-	Images []string
+	Prompt      string
+	Attachments []chatAttachmentInput
+}
+
+type chatAttachmentInput struct {
+	Source   string
+	Filename string
+	Image    bool
 }
 
 type parsedChat struct {
-	ResponseID     string
-	ConversationID string
-	ParentID       string
-	Text           strings.Builder
-	Reasoning      strings.Builder
-	Images         []string
-	SearchSources  []map[string]any
-	Annotations    []map[string]any
-	sourceKeys     map[string]struct{}
-	serverToolKeys map[string]struct{}
-	webSearchKeys  map[string]struct{}
-	cardCache      map[string]map[string]any
-	citationIndex  map[string]int
-	lastCitation   int
-	ServerTools    int64
-	WebSearchTools int64
-	InputTokens    int64
-	ToolCalls      []parsedToolCall
-	Tools          []any
-	ToolChoice     any
-	ParallelTools  bool
+	ResponseID      string
+	ConversationID  string
+	ParentID        string
+	Text            strings.Builder
+	upstreamText    strings.Builder
+	Reasoning       strings.Builder
+	Images          []string
+	SearchSources   []map[string]any
+	Annotations     []map[string]any
+	sourceKeys      map[string]struct{}
+	serverToolKeys  map[string]struct{}
+	webSearchKeys   map[string]struct{}
+	cardCache       map[string]map[string]any
+	moderatedImages map[string]struct{}
+	citationIndex   map[string]int
+	lastCitation    int
+	ServerTools     int64
+	WebSearchTools  int64
+	InputTokens     int64
+	ToolCalls       []parsedToolCall
+	Tools           []any
+	ToolChoice      any
+	ParallelTools   bool
 }
 
 func (a *Adapter) ForwardResponse(ctx context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
@@ -159,9 +167,13 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	for attempt := 0; attempt < 2; attempt++ {
 		upstream, lease, currentPrevious, statsigTarget, openErr := a.openChat(ctx, request.Credential, input.PreviousResponseID, spec, normalized)
 		if openErr != nil {
-			if errors.Is(openErr, errInvalidChatImage) {
+			if errors.Is(openErr, errInvalidChatAttachment) || errors.Is(openErr, errInvalidChatImage) || errors.Is(openErr, errInvalidChatFile) {
+				code := "invalid_attachment_input"
+				if errors.Is(openErr, errInvalidChatImage) {
+					code = "invalid_image_input"
+				}
 				return jsonProviderResponse(http.StatusBadRequest, map[string]any{"error": map[string]any{
-					"message": openErr.Error(), "type": "invalid_request_error", "code": "invalid_image_input",
+					"message": openErr.Error(), "type": "invalid_request_error", "code": code,
 				}}), nil
 			}
 			return nil, openErr
@@ -313,7 +325,7 @@ func (a *Adapter) openChat(ctx context.Context, credential account.Credential, p
 		previous = &state
 		endpoint = cfg.BaseURL + "/rest/app-chat/conversations/" + url.PathEscape(state.ConversationID) + "/responses"
 	}
-	attachments, err := a.prepareChatAttachments(ctx, cfg, lease, token, input.Images)
+	attachments, err := a.prepareChatAttachments(ctx, cfg, lease, token, input.Attachments)
 	if err != nil {
 		lease.Release()
 		return nil, nil, nil, "", err
@@ -530,7 +542,7 @@ func normalizeOpenAIInput(input openAIRequest, operation string) (normalizedChat
 		return normalizedChatInput{}, errors.New("messages 不能为空")
 	}
 	var builder strings.Builder
-	images := make([]string, 0, 2)
+	attachments := make([]chatAttachmentInput, 0, 2)
 	for _, message := range messages {
 		typeName := strings.ToLower(strings.TrimSpace(message.Type))
 		if typeName == "function_call" {
@@ -560,11 +572,11 @@ func normalizeOpenAIInput(input openAIRequest, operation string) (normalizedChat
 			builder.WriteString("\n\n")
 			continue
 		}
-		text, messageImages, err := contentTextAndImages(message.Content)
+		text, messageAttachments, err := contentTextAndAttachments(message.Content)
 		if err != nil {
 			return normalizedChatInput{}, err
 		}
-		images = append(images, messageImages...)
+		attachments = append(attachments, messageAttachments...)
 		if len(message.ToolCalls) > 0 {
 			xml := toolCallsToXML(message.ToolCalls)
 			if text != "" && xml != "" {
@@ -586,13 +598,13 @@ func normalizeOpenAIInput(input openAIRequest, operation string) (normalizedChat
 		builder.WriteString("\n\n")
 	}
 	value := strings.TrimSpace(builder.String())
-	if value == "" && len(images) == 0 {
-		return normalizedChatInput{}, errors.New("消息中没有可发送的文本或图片")
+	if value == "" && len(attachments) == 0 {
+		return normalizedChatInput{}, errors.New("消息中没有可发送的文本或附件")
 	}
-	if len(images) > maxChatImageAttachments {
-		return normalizedChatInput{}, fmt.Errorf("单次对话最多支持 %d 张图片", maxChatImageAttachments)
+	if len(attachments) > maxChatAttachments {
+		return normalizedChatInput{}, fmt.Errorf("单次对话最多支持 %d 个附件", maxChatAttachments)
 	}
-	return normalizedChatInput{Prompt: value, Images: images}, nil
+	return normalizedChatInput{Prompt: value, Attachments: attachments}, nil
 }
 
 func rawTextValue(raw json.RawMessage) (string, error) {
@@ -610,7 +622,7 @@ func rawTextValue(raw json.RawMessage) (string, error) {
 	return string(trimmed), nil
 }
 
-func contentTextAndImages(raw json.RawMessage) (string, []string, error) {
+func contentTextAndAttachments(raw json.RawMessage) (string, []chatAttachmentInput, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return "", nil, nil
@@ -627,7 +639,7 @@ func contentTextAndImages(raw json.RawMessage) (string, []string, error) {
 		return "", nil, errors.New("消息 content 必须是字符串或内容数组")
 	}
 	values := make([]string, 0, len(parts))
-	images := make([]string, 0, 2)
+	attachments := make([]chatAttachmentInput, 0, 2)
 	for _, part := range parts {
 		typeName, _ := part["type"].(string)
 		switch typeName {
@@ -637,19 +649,49 @@ func contentTextAndImages(raw json.RawMessage) (string, []string, error) {
 			}
 		case "image_url", "input_image", "image":
 			if value := extractImageURL(part); value != "" {
-				images = append(images, value)
+				attachments = append(attachments, chatAttachmentInput{Source: value, Image: true})
 			} else if fileID, _ := part["file_id"].(string); fileID != "" {
 				return "", nil, errors.New("Grok Web 对话暂不支持 input_image.file_id，请使用 image_url 或 Base64 data URI")
 			} else {
 				return "", nil, errors.New("图片内容缺少 image_url")
 			}
-		case "input_audio", "file", "input_file":
-			return "", nil, fmt.Errorf("Grok Web 对话暂不支持 %s 内容", typeName)
+		case "file", "input_file":
+			attachment, err := extractFileAttachment(part)
+			if err != nil {
+				return "", nil, err
+			}
+			attachments = append(attachments, attachment)
+		case "input_audio":
+			return "", nil, errors.New("Grok Web 对话暂不支持 input_audio 内容")
 		default:
 			return "", nil, fmt.Errorf("Grok Web 对话暂不支持 content.type=%q", typeName)
 		}
 	}
-	return strings.Join(values, "\n"), images, nil
+	return strings.Join(values, "\n"), attachments, nil
+}
+
+func extractFileAttachment(part map[string]any) (chatAttachmentInput, error) {
+	value := part
+	if nested, _ := part["file"].(map[string]any); nested != nil {
+		value = nested
+	}
+	if fileID, _ := value["file_id"].(string); strings.TrimSpace(fileID) != "" {
+		return chatAttachmentInput{}, errors.New("Grok Web 对话暂不支持 input_file.file_id，请使用 file_url 或 file_data")
+	}
+	fileURL, _ := value["file_url"].(string)
+	fileData, _ := value["file_data"].(string)
+	if strings.TrimSpace(fileURL) != "" && strings.TrimSpace(fileData) != "" {
+		return chatAttachmentInput{}, errors.New("input_file 不能同时提供 file_url 和 file_data")
+	}
+	source := strings.TrimSpace(fileURL)
+	if source == "" {
+		source = strings.TrimSpace(fileData)
+	}
+	if source == "" {
+		return chatAttachmentInput{}, errors.New("input_file 缺少 file_url 或 file_data")
+	}
+	filename, _ := value["filename"].(string)
+	return chatAttachmentInput{Source: source, Filename: strings.TrimSpace(filename)}, nil
 }
 
 func extractImageURL(part map[string]any) string {
@@ -796,20 +838,21 @@ func parseUpstreamFrame(data []byte, parsed *parsedChat) (string, string, error)
 	tag, _ := response["messageTag"].(string)
 	if tag == "tool_usage_card" {
 		collectServerTool(parsed, response)
+		// tool_usage_card 的 token 是 Grok 内部 XML 协议，不属于模型 reasoning。
+		return "", "", nil
 	}
 	if token != "" && thinking {
 		parsed.Reasoning.WriteString(token)
 		return "reasoning", token, nil
 	}
 	if token != "" && !thinking && (tag == "final" || tag == "") {
+		parsed.upstreamText.WriteString(token)
 		cleaned := cleanChatToken(parsed, token)
 		parsed.Text.WriteString(cleaned)
 		return "text", cleaned, nil
 	}
 	if modelResponse, _ := response["modelResponse"].(map[string]any); modelResponse != nil {
-		if first := collectModelResponseImages(parsed, modelResponse); first != "" {
-			return "image", first, nil
-		}
+		return collectModelResponse(parsed, modelResponse)
 	}
 	if imageResponse, _ := response["streamingImageGenerationResponse"].(map[string]any); imageResponse != nil {
 		rawURL, _ := imageResponse["imageUrl"].(string)
@@ -817,6 +860,11 @@ func parseUpstreamFrame(data []byte, parsed *parsedChat) (string, string, error)
 			rawURL, _ = imageResponse["url"].(string)
 		}
 		if rawURL != "" {
+			moderated, _ := imageResponse["moderated"].(bool)
+			if moderated {
+				markModeratedImage(parsed, rawURL)
+				return "", "", nil
+			}
 			completed, _ := imageResponse["isFinal"].(bool)
 			if completed || imageResponse["progress"] == float64(100) {
 				rawURL = absoluteAssetURL(rawURL)
@@ -826,6 +874,64 @@ func parseUpstreamFrame(data []byte, parsed *parsedChat) (string, string, error)
 		}
 	}
 	return "", "", nil
+}
+
+func collectModelResponse(parsed *parsedChat, modelResponse map[string]any) (string, string, error) {
+	if err := modelResponseStreamError(modelResponse); err != nil {
+		return "", "", err
+	}
+	if parsed.ParentID == "" {
+		parsed.ParentID, _ = modelResponse["parentResponseId"].(string)
+	}
+	collectSearchSources(parsed, modelResponse)
+	firstImage := collectModelResponseImages(parsed, modelResponse)
+	message, _ := modelResponse["message"].(string)
+	if delta := mergeModelResponseText(parsed, message); delta != "" {
+		return "text", delta, nil
+	}
+	if firstImage != "" {
+		return "image", firstImage, nil
+	}
+	return "", "", nil
+}
+
+func mergeModelResponseText(parsed *parsedChat, message string) string {
+	if message == "" {
+		return ""
+	}
+	raw := parsed.upstreamText.String()
+	if raw == message || strings.HasPrefix(raw, message) {
+		return ""
+	}
+	if raw != "" && !strings.HasPrefix(message, raw) {
+		// 已输出内容与最终 envelope 不同，保留已输出结果，避免重复或回滚流式内容。
+		return ""
+	}
+	delta := message[len(raw):]
+	parsed.upstreamText.WriteString(delta)
+	delta = cleanChatToken(parsed, delta)
+	parsed.Text.WriteString(delta)
+	return delta
+}
+
+func modelResponseStreamError(modelResponse map[string]any) error {
+	values, _ := modelResponse["streamErrors"].([]any)
+	for _, raw := range values {
+		switch value := raw.(type) {
+		case string:
+			if message := strings.TrimSpace(value); message != "" {
+				return errors.New(message)
+			}
+		case map[string]any:
+			if nested, _ := value["error"].(map[string]any); nested != nil {
+				return webResponseError(nested)
+			}
+			if message := firstString(value, "message", "error", "detail"); message != "" {
+				return webResponseError(map[string]any{"message": message, "code": value["code"]})
+			}
+		}
+	}
+	return nil
 }
 
 func webResponseError(value map[string]any) error {
@@ -858,6 +964,9 @@ func collectModelResponseImages(parsed *parsedChat, modelResponse map[string]any
 			return
 		}
 		value = absoluteAssetURL(value)
+		if _, moderated := parsed.moderatedImages[value]; moderated {
+			return
+		}
 		if containsString(parsed.Images, value) {
 			return
 		}
@@ -885,37 +994,58 @@ func collectModelResponseImages(parsed *parsedChat, modelResponse map[string]any
 	return first
 }
 
+func markModeratedImage(parsed *parsedChat, value string) {
+	if strings.TrimSpace(value) == "" {
+		return
+	}
+	if parsed.moderatedImages == nil {
+		parsed.moderatedImages = make(map[string]struct{})
+	}
+	parsed.moderatedImages[absoluteAssetURL(value)] = struct{}{}
+}
+
 func collectSearchSources(parsed *parsedChat, response map[string]any) {
 	if parsed.sourceKeys == nil {
 		parsed.sourceKeys = make(map[string]struct{})
 	}
-	if search, _ := response["webSearchResults"].(map[string]any); search != nil {
-		if values, ok := search["results"].([]any); ok {
-			for _, raw := range values {
-				item, _ := raw.(map[string]any)
-				value, _ := item["url"].(string)
-				if value == "" {
-					continue
-				}
-				title, _ := item["title"].(string)
-				appendSearchSource(parsed, value, title, "web")
-			}
-		}
+	collectWebSearchResults(parsed, response["webSearchResults"])
+	collectWebSearchResults(parsed, response["citedWebSearchResults"])
+	collectXSearchResults(parsed, response["xSearchResults"])
+	collectXSearchResults(parsed, response["xposts"])
+	collectXSearchResults(parsed, response["citedXposts"])
+}
+
+func collectWebSearchResults(parsed *parsedChat, value any) {
+	if wrapped, _ := value.(map[string]any); wrapped != nil {
+		value = wrapped["results"]
 	}
-	if search, _ := response["xSearchResults"].(map[string]any); search != nil {
-		if values, ok := search["results"].([]any); ok {
-			for _, raw := range values {
-				item, _ := raw.(map[string]any)
-				username, _ := item["username"].(string)
-				postID, _ := item["postId"].(string)
-				if username == "" || postID == "" {
-					continue
-				}
-				title, _ := item["text"].(string)
-				value := "https://x.com/" + url.PathEscape(username) + "/status/" + url.PathEscape(postID)
-				appendSearchSource(parsed, value, title, "x_post")
-			}
+	values, _ := value.([]any)
+	for _, raw := range values {
+		item, _ := raw.(map[string]any)
+		rawURL, _ := item["url"].(string)
+		if rawURL == "" {
+			continue
 		}
+		title, _ := item["title"].(string)
+		appendSearchSource(parsed, rawURL, title, "web")
+	}
+}
+
+func collectXSearchResults(parsed *parsedChat, value any) {
+	if wrapped, _ := value.(map[string]any); wrapped != nil {
+		value = wrapped["results"]
+	}
+	values, _ := value.([]any)
+	for _, raw := range values {
+		item, _ := raw.(map[string]any)
+		username, _ := item["username"].(string)
+		postID, _ := item["postId"].(string)
+		if username == "" || postID == "" {
+			continue
+		}
+		title, _ := item["text"].(string)
+		rawURL := "https://x.com/" + url.PathEscape(username) + "/status/" + url.PathEscape(postID)
+		appendSearchSource(parsed, rawURL, title, "x_post")
 	}
 }
 
@@ -985,6 +1115,30 @@ func serverToolKey(response map[string]any) string {
 func webServerToolName(response map[string]any) string {
 	if name := strings.ToLower(strings.TrimSpace(firstString(response, "toolName", "tool_name"))); name != "" {
 		return name
+	}
+	if card, _ := response["toolUsageCard"].(map[string]any); card != nil {
+		if name := strings.ToLower(strings.TrimSpace(firstString(card, "toolName", "tool_name", "name"))); name != "" {
+			return name
+		}
+		for _, tool := range []struct {
+			field string
+			name  string
+		}{
+			{field: "webSearch", name: "web_search"},
+			{field: "web_search", name: "web_search"},
+			{field: "xSearch", name: "x_search"},
+			{field: "x_search", name: "x_search"},
+			{field: "browsePage", name: "browse_page"},
+			{field: "browse_page", name: "browse_page"},
+			{field: "searchImages", name: "search_images"},
+			{field: "search_images", name: "search_images"},
+			{field: "chatroomSend", name: "chatroom_send"},
+			{field: "chatroom_send", name: "chatroom_send"},
+		} {
+			if card[tool.field] != nil {
+				return tool.name
+			}
+		}
 	}
 	token, _ := response["token"].(string)
 	match := grokToolNamePattern.FindStringSubmatch(token)
