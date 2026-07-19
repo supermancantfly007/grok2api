@@ -15,6 +15,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/pkg/batch"
+	"github.com/chenyme/grok2api/backend/internal/pkg/resultcache"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 	"golang.org/x/sync/singleflight"
 )
@@ -31,6 +32,7 @@ var (
 	ErrNotFound       = errors.New("账号不存在")
 	ErrUnsupported    = errors.New("账号来源不支持该操作")
 	ErrConversionBusy = errors.New("账号正在转换为 Grok Build")
+	ErrConflict       = errors.New("账号操作存在冲突")
 )
 
 var ErrCredentialRefreshPermanent = errors.New("OAuth refresh token 已永久失效")
@@ -44,6 +46,7 @@ const (
 	credentialRefreshSafetyPoll time.Duration = time.Minute
 	credentialRefreshTimeout    time.Duration = 30 * time.Second
 	credentialRefreshStateTTL   time.Duration = 5 * time.Second
+	credentialStateWriteTimeout time.Duration = 5 * time.Second
 	credentialRefreshBatchSize                = 100
 	managedTaskWorkerCeiling                  = 50
 	webQuotaRefreshQueueSize                  = 4096
@@ -54,9 +57,11 @@ const (
 	maxBuildConversionAccounts                = 1000
 	maxWebConsoleSyncAccounts                 = 1000
 	accountTaskBatchSize                      = 1000
+	buildBotFlagCacheTTL        time.Duration = 30 * time.Second
 )
 
 const permanentRefreshExpiredReason = "OAuth refresh token 已永久失效且 access token 已过期"
+const buildBotFlagCacheKey = "build-bot-flagged-account-ids"
 
 type webQuotaRefreshState struct {
 	pending bool
@@ -102,10 +107,11 @@ type QuotaView struct {
 }
 
 type View struct {
-	Credential   accountdomain.Credential
-	Billing      *accountdomain.Billing
-	Quota        QuotaView
-	QuotaWindows []accountdomain.QuotaWindow
+	Credential      accountdomain.Credential
+	Billing         *accountdomain.Billing
+	Quota           QuotaView
+	QuotaWindows    []accountdomain.QuotaWindow
+	BuildBotFlagged bool
 }
 
 type UpdateInput struct {
@@ -116,7 +122,19 @@ type UpdateInput struct {
 	MinimumRemaining       *float64
 	CloudflareCookies      *string
 	ClearCloudflareCookies bool
+	// BuildSuperEntitled 仅 grok_build 可设置；非 Build 返回业务错误。
+	BuildSuperEntitled *bool
+	// BuildRouteMode 仅 grok_build 可设置；nil 表示不修改。
+	BuildRouteMode *accountdomain.BuildRouteMode
 }
+
+type CleanupStatus string
+
+const (
+	CleanupStatusCooldown       CleanupStatus = "cooldown"
+	CleanupStatusDisabled       CleanupStatus = "disabled"
+	CleanupStatusReauthRequired CleanupStatus = "reauthRequired"
+)
 
 type DeviceStartResult struct {
 	SessionID               string
@@ -171,6 +189,7 @@ type ListFilter struct {
 	QuotaType string
 	Status    string
 	Renewal   string
+	Risk      string
 	Sort      repository.SortQuery
 }
 
@@ -179,6 +198,7 @@ type Summary struct {
 	Available  int64
 	Recovering int64
 	Attention  int64
+	Risk       int64
 	Providers  map[string]ProviderSummary
 	Recovery   RecoverySummary
 	Issues     IssueSummary
@@ -221,6 +241,11 @@ func (s *Service) Summary(ctx context.Context) (Summary, error) {
 	}
 	result.Recovering = result.Recovery.Cooldown + result.Recovery.WaitingReset + result.Recovery.Probing
 	result.Attention = result.Issues.Disabled + result.Issues.ReauthRequired
+	flaggedIDs, err := s.buildBotFlaggedAccountIDs(ctx)
+	if err != nil {
+		return Summary{}, err
+	}
+	result.Risk = int64(len(flaggedIDs))
 	return result, nil
 }
 
@@ -237,6 +262,7 @@ type Service struct {
 	refreshes             singleflight.Group
 	billingSyncs          singleflight.Group
 	quotaSyncs            singleflight.Group
+	identitySyncs         singleflight.Group
 	refreshMu             sync.Mutex
 	lastRefreshAt         map[uint64]time.Time
 	quotaRefreshMu        sync.Mutex
@@ -246,6 +272,7 @@ type Service struct {
 	syncPool              *batch.Pool
 	refreshPool           *batch.Pool
 	credentialRefreshWake chan struct{}
+	buildBotFlagCache     *resultcache.Cache[string, []uint64]
 	logger                *slog.Logger
 	now                   func() time.Time
 }
@@ -261,6 +288,7 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 		lastRefreshAt: make(map[uint64]time.Time), quotaRefreshes: make(map[string]*webQuotaRefreshState),
 		quotaRefreshQueue:     make(chan webQuotaRefreshRequest, webQuotaRefreshQueueSize),
 		credentialRefreshWake: make(chan struct{}, 1),
+		buildBotFlagCache:     resultcache.New[string, []uint64](1, buildBotFlagCacheTTL),
 		conversionPool:        batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), logger: slog.Default(),
 		now: func() time.Time { return time.Now().UTC() },
 	}
@@ -301,7 +329,7 @@ func (s *Service) ProviderDefinition(value accountdomain.Provider) (provider.Def
 
 func (s *Service) List(ctx context.Context, page, pageSize int, search string, filter ListFilter) ([]View, int64, error) {
 	page, pageSize = normalizePage(page, pageSize)
-	if (filter.Provider != "" && !accountdomain.Provider(filter.Provider).IsValid()) || !oneOf(filter.QuotaType, "", "free", "paid", "unknown", "auto", "basic", "super", "heavy") || !oneOf(filter.Status, "", "active", "disabled", "reauthRequired", "cooldown", "waitingReset", "probing") || !oneOf(filter.Renewal, "", "refreshable", "unrefreshable") || !repository.IsValidSort(filter.Sort, "name", "type", "status", "createdAt") {
+	if (filter.Provider != "" && !accountdomain.Provider(filter.Provider).IsValid()) || !oneOf(filter.QuotaType, "", "free", "paid", "unknown", "auto", "basic", "super", "heavy") || !oneOf(filter.Status, "", "active", "disabled", "reauthRequired", "cooldown", "waitingReset", "probing") || !oneOf(filter.Renewal, "", "refreshable", "unrefreshable") || !oneOf(filter.Risk, "", "flagged", "normal") || (filter.Risk != "" && filter.Provider != string(accountdomain.ProviderBuild)) || !repository.IsValidSort(filter.Sort, "name", "type", "status", "createdAt") {
 		return nil, 0, ErrInvalidFilter
 	}
 	var refreshable *bool
@@ -309,9 +337,22 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		value := filter.Renewal == "refreshable"
 		refreshable = &value
 	}
+	repositoryFilter := repository.AccountListFilter{Provider: filter.Provider, QuotaType: filter.QuotaType, Status: filter.Status, Refreshable: refreshable, Now: s.now()}
+	if filter.Risk != "" {
+		flaggedIDs, err := s.buildBotFlaggedAccountIDs(ctx)
+		if err != nil {
+			return nil, 0, err
+		}
+		if filter.Risk == "flagged" {
+			repositoryFilter.AccountIDs = flaggedIDs
+			repositoryFilter.RestrictIDs = true
+		} else {
+			repositoryFilter.ExcludeIDs = flaggedIDs
+		}
+	}
 	values, total, err := s.accounts.List(ctx, repository.AccountListQuery{
 		Page:   repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search, Sort: filter.Sort},
-		Filter: repository.AccountListFilter{Provider: filter.Provider, QuotaType: filter.QuotaType, Status: filter.Status, Refreshable: refreshable, Now: time.Now().UTC()},
+		Filter: repositoryFilter,
 	})
 	if err != nil {
 		return nil, 0, err
@@ -338,7 +379,8 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 	}
 	views := make([]View, 0, len(values))
 	for _, value := range values {
-		view := View{Credential: value}
+		metadata := s.credentialMetadata(value)
+		view := View{Credential: value, BuildBotFlagged: metadata.BuildBotFlagged}
 		if billing, ok := billings[value.ID]; ok {
 			view.Billing = &billing
 		}
@@ -346,11 +388,47 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		if recoveryValue, ok := recoveries[value.ID]; ok {
 			recovery = &recoveryValue
 		}
-		view.Quota = newQuotaView(view.Billing, observedTokens[value.ID], recovery, value.ObservedModel)
+		view.Quota = newQuotaView(view.Billing, observedTokens[value.ID], recovery, value.ObservedModel, value.BuildSuperEntitled && value.Provider == accountdomain.ProviderBuild)
 		view.QuotaWindows = quotaWindows[value.ID]
 		views = append(views, view)
 	}
 	return views, total, nil
+}
+
+func (s *Service) buildBotFlaggedAccountIDs(ctx context.Context) ([]uint64, error) {
+	if s.buildBotFlagCache == nil {
+		return s.loadBuildBotFlaggedAccountIDs(ctx)
+	}
+	return s.buildBotFlagCache.Load(ctx, buildBotFlagCacheKey, s.now(), func() ([]uint64, error) {
+		return s.loadBuildBotFlaggedAccountIDs(ctx)
+	})
+}
+
+func (s *Service) loadBuildBotFlaggedAccountIDs(ctx context.Context) ([]uint64, error) {
+	const batchSize = 500
+	result := make([]uint64, 0)
+	var afterID uint64
+	for {
+		values, _, err := s.accounts.ListProviderAccountBatch(ctx, accountdomain.ProviderBuild, afterID, batchSize)
+		if err != nil {
+			return nil, err
+		}
+		for _, value := range values {
+			if s.credentialMetadata(value).BuildBotFlagged {
+				result = append(result, value.ID)
+			}
+		}
+		if len(values) < batchSize {
+			return result, nil
+		}
+		afterID = values[len(values)-1].ID
+	}
+}
+
+func (s *Service) invalidateBuildBotFlagCache() {
+	if s.buildBotFlagCache != nil {
+		s.buildBotFlagCache.Delete(buildBotFlagCacheKey)
+	}
 }
 
 func oneOf(value string, allowed ...string) bool {
@@ -362,7 +440,7 @@ func oneOf(value string, allowed ...string) bool {
 	return false
 }
 
-// BatchUpdate 对一组账号应用同一组路由参数，单次最多处理 500 个账号。
+// BatchUpdate 对一组账号应用同一组路由参数，单次最多处理一个管理端最大分页。
 func (s *Service) BatchUpdate(ctx context.Context, ids []uint64, input UpdateInput) (int64, error) {
 	ids, err := normalizeBatchIDs(ids)
 	if err != nil {
@@ -402,6 +480,9 @@ func (s *Service) BatchDelete(ctx context.Context, ids []uint64) (int64, error) 
 		s.clearRefreshState(id)
 	}
 	deleted, err := s.accounts.DeleteMany(ctx, ids)
+	if err == nil {
+		s.invalidateBuildBotFlagCache()
+	}
 	return deleted, mapRepositoryError(err)
 }
 
@@ -470,12 +551,79 @@ func (s *Service) BatchDeleteByStatus(ctx context.Context, providerValue, status
 	return deleted, nil
 }
 
+// AccountsBelongToProvider 校验批量账号是否全部属于指定号池。
+// 该校验只读取账号主表，避免详情页的额度、审计或关联查询影响批量操作。
+func (s *Service) AccountsBelongToProvider(ctx context.Context, ids []uint64, providerValue accountdomain.Provider) (bool, error) {
+	if !providerValue.IsValid() {
+		return false, invalidInput("账号来源无效")
+	}
+	values, err := normalizeBatchIDs(ids)
+	if err != nil {
+		return false, err
+	}
+	count, err := s.accounts.CountProviderAccountsByIDs(ctx, providerValue, values)
+	if err != nil {
+		return false, err
+	}
+	return count == int64(len(values)), nil
+}
+
+// CleanupAccounts 按管理端状态清理指定 Provider 账号；正常、待重置和检测中的账号不在清理范围内。
+func (s *Service) CleanupAccounts(ctx context.Context, providerValue accountdomain.Provider, statuses []CleanupStatus) (int64, error) {
+	if !providerValue.IsValid() {
+		return 0, invalidInput("账号来源无效")
+	}
+	selected := make(map[CleanupStatus]struct{}, len(statuses))
+	for _, status := range statuses {
+		switch status {
+		case CleanupStatusCooldown, CleanupStatusDisabled, CleanupStatusReauthRequired:
+			selected[status] = struct{}{}
+		default:
+			return 0, invalidInput("账号清理状态无效")
+		}
+	}
+	if len(selected) == 0 {
+		return 0, invalidInput("至少选择一种账号状态")
+	}
+
+	const cleanupBatchSize = 500
+	now := s.now()
+	var deleted int64
+	for _, status := range []CleanupStatus{CleanupStatusDisabled, CleanupStatusReauthRequired, CleanupStatusCooldown} {
+		if _, ok := selected[status]; !ok {
+			continue
+		}
+		for {
+			ids, candidates, err := s.accounts.DeleteAccountStatusBatch(ctx, providerValue, string(status), now, cleanupBatchSize)
+			if err != nil {
+				return deleted, mapRepositoryError(err)
+			}
+			for _, id := range ids {
+				if s.sticky != nil {
+					_ = s.sticky.DeleteByAccount(ctx, id)
+				}
+				s.clearRefreshState(id)
+			}
+			deleted += int64(len(ids))
+			if candidates < cleanupBatchSize {
+				break
+			}
+		}
+	}
+	if deleted > 0 {
+		s.invalidateBuildBotFlagCache()
+	}
+	return deleted, nil
+}
+
+
 func (s *Service) Get(ctx context.Context, id uint64) (View, error) {
 	value, err := s.accounts.Get(ctx, id)
 	if err != nil {
 		return View{}, mapRepositoryError(err)
 	}
-	view := View{Credential: value}
+	metadata := s.credentialMetadata(value)
+	view := View{Credential: value, BuildBotFlagged: metadata.BuildBotFlagged}
 	if billing, err := s.accounts.GetBilling(ctx, id); err == nil {
 		view.Billing = &billing
 	} else if !errors.Is(err, repository.ErrNotFound) {
@@ -491,13 +639,20 @@ func (s *Service) Get(ctx context.Context, id uint64) (View, error) {
 	} else if !errors.Is(err, repository.ErrNotFound) {
 		return View{}, err
 	}
-	view.Quota = newQuotaView(view.Billing, observedTokens[id], recovery, value.ObservedModel)
+	view.Quota = newQuotaView(view.Billing, observedTokens[id], recovery, value.ObservedModel, value.BuildSuperEntitled && value.Provider == accountdomain.ProviderBuild)
 	if windows, err := s.accounts.GetQuotaWindows(ctx, []uint64{id}); err == nil {
 		view.QuotaWindows = windows[id]
 	} else {
 		return View{}, err
 	}
 	return view, nil
+}
+
+func (s *Service) credentialMetadata(value accountdomain.Credential) provider.CredentialMetadata {
+	if s.providers == nil {
+		return provider.CredentialMetadata{}
+	}
+	return s.providers.CredentialMetadata(value)
 }
 
 func (s *Service) ObserveResponseModel(ctx context.Context, id uint64, model string) error {
@@ -508,35 +663,14 @@ func (s *Service) ObserveResponseModel(ctx context.Context, id uint64, model str
 	return s.accounts.UpdateObservedModel(ctx, id, model, time.Now().UTC())
 }
 
-func newQuotaView(billing *accountdomain.Billing, observedTokens int64, recovery *accountdomain.QuotaRecovery, observedModel string) QuotaView {
-	if recovery != nil && recovery.Status != accountdomain.QuotaRecoveryStatusActive && (recovery.Kind == "" || recovery.Kind == accountdomain.QuotaRecoveryKindFree) {
-		limit := recovery.ConfirmedLimit
-		used := recovery.ConfirmedUsed
-		if used <= 0 {
-			used = observedTokens
-		}
-		status := QuotaStatusWaitingReset
-		if recovery.Status == accountdomain.QuotaRecoveryStatusProbing {
-			status = QuotaStatusProbing
-		}
-		remaining := int64(0)
-		usagePercent := 0.0
-		if limit > 0 {
-			remaining = limit - used
-			if remaining < 0 {
-				remaining = 0
-			}
-			usagePercent = float64(used) / float64(limit) * 100
-		}
-		return QuotaView{
-			Type: QuotaTypeFree, Source: "upstreamExhaustion", Confidence: "confirmed", Unit: "tokens", Used: float64(used), Limit: float64(limit), LimitKnown: limit > 0,
-			Remaining: float64(remaining), UsagePercent: usagePercent,
-			WindowHours: int(freeUsageWindow / time.Hour), Confirmed: true, Status: status,
-			ExhaustedAt: recovery.ExhaustedAt, NextProbeAt: recovery.NextProbeAt, LastConfirmedAt: recovery.LastConfirmedAt,
-		}
-	}
+func newQuotaView(billing *accountdomain.Billing, observedTokens int64, recovery *accountdomain.QuotaRecovery, observedModel string, buildSuperEntitled bool) QuotaView {
+	// Billing paid 优先：保留真实额度数值。
 	if billing != nil && billing.IsPaid() {
-		result := QuotaView{Type: QuotaTypePaid, Source: "upstreamBilling", Confidence: "observed", Unit: "credits", UsagePercent: billing.CreditUsagePercent, Status: QuotaStatusActive, PeriodStart: billing.BillingPeriodStart, PeriodEnd: billing.BillingPeriodEnd}
+		periodStart, periodEnd := billing.BillingPeriodStart, billing.BillingPeriodEnd
+		if billing.UsagePeriodType != "" {
+			periodStart, periodEnd = billing.UsagePeriodStart, billing.UsagePeriodEnd
+		}
+		result := QuotaView{Type: QuotaTypePaid, Source: "upstreamBilling", Confidence: "observed", Unit: "credits", UsagePercent: billing.CreditUsagePercent, Status: QuotaStatusActive, PeriodStart: periodStart, PeriodEnd: periodEnd}
 		if recovery != nil && recovery.Kind == accountdomain.QuotaRecoveryKindPaid {
 			result.Status = QuotaStatusWaitingReset
 			if recovery.Status == accountdomain.QuotaRecoveryStatusProbing {
@@ -566,8 +700,48 @@ func newQuotaView(billing *accountdomain.Billing, observedTokens int64, recovery
 			}
 		case billing.PrepaidBalance > 0:
 			result.Remaining = billing.PrepaidBalance
+		case billing.UsagePeriodType != "":
+			result.Unit = "percent"
+			result.Used = billing.CreditUsagePercent
+			result.Limit = 100
+			result.Remaining = max(0, 100-billing.CreditUsagePercent)
+			result.LimitKnown = true
 		}
 		return result
+	}
+	// 管理员确认的 Build Super entitlement：覆盖 Free recovery / profile / observed free 等弱信号。
+	// 不伪造额度、余额、使用率或账期；Billing 数值保持未知/零。
+	if buildSuperEntitled {
+		return QuotaView{
+			Type: QuotaTypePaid, Source: "buildSuperEntitlement", Confidence: "confirmed",
+			Confirmed: true, Status: QuotaStatusActive,
+		}
+	}
+	if recovery != nil && recovery.Status != accountdomain.QuotaRecoveryStatusActive && (recovery.Kind == "" || recovery.Kind == accountdomain.QuotaRecoveryKindFree) {
+		limit := recovery.ConfirmedLimit
+		used := recovery.ConfirmedUsed
+		if used <= 0 {
+			used = observedTokens
+		}
+		status := QuotaStatusWaitingReset
+		if recovery.Status == accountdomain.QuotaRecoveryStatusProbing {
+			status = QuotaStatusProbing
+		}
+		remaining := int64(0)
+		usagePercent := 0.0
+		if limit > 0 {
+			remaining = limit - used
+			if remaining < 0 {
+				remaining = 0
+			}
+			usagePercent = float64(used) / float64(limit) * 100
+		}
+		return QuotaView{
+			Type: QuotaTypeFree, Source: "upstreamExhaustion", Confidence: "confirmed", Unit: "tokens", Used: float64(used), Limit: float64(limit), LimitKnown: limit > 0,
+			Remaining: float64(remaining), UsagePercent: usagePercent,
+			WindowHours: int(freeUsageWindow / time.Hour), Confirmed: true, Status: status,
+			ExhaustedAt: recovery.ExhaustedAt, NextProbeAt: recovery.NextProbeAt, LastConfirmedAt: recovery.LastConfirmedAt,
+		}
 	}
 	freeSource := ""
 	confidence := ""
@@ -667,6 +841,7 @@ func (s *Service) PollDeviceLogin(ctx context.Context, sessionID string) (View, 
 	if err != nil {
 		return View{}, err
 	}
+	s.reconcileProviderLinksBestEffort(ctx, value.ID)
 	_ = s.deviceSessions.Delete(ctx, sessionID)
 	return s.Get(ctx, value.ID)
 }
@@ -794,6 +969,7 @@ func (s *Service) persistImportedSeeds(ctx context.Context, seeds []provider.Cre
 		}
 		for _, value := range stored {
 			result.AccountIDs = append(result.AccountIDs, value.ID)
+			s.reconcileProviderLinksBestEffort(ctx, value.ID)
 			if observer != nil {
 				if err := observer(value.ID); err != nil {
 					return ImportResult{}, err
@@ -1221,7 +1397,7 @@ func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strat
 	seed, err := converter.ConvertToBuild(ctx, value)
 	if err != nil {
 		if errors.Is(err, provider.ErrUnauthorized) {
-			_ = s.MarkReauthRequired(context.WithoutCancel(ctx), id, "Grok Web SSO credential rejected")
+			err = errors.Join(err, s.markSSOCredentialRejected(ctx, value, "Grok Web SSO credential rejected"))
 		}
 		return 0, false, false, err
 	}
@@ -1243,15 +1419,26 @@ func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strat
 	return buildAccount.ID, created, false, nil
 }
 
-// ExportCredentials 导出可由当前导入接口重新读取的 Grok Build OAuth 凭据文档。
+// ExportCredentials 保留 Grok Build 默认导出语义，供旧调用方兼容。
 func (s *Service) ExportCredentials(ctx context.Context) (ExportResult, error) {
-	adapter, ok := s.providers.CredentialCodec(accountdomain.ProviderBuild)
+	return s.ExportProviderCredentials(ctx, accountdomain.ProviderBuild)
+}
+
+// ExportProviderCredentials 导出可由对应 Provider 导入接口重新读取的凭据文档。
+func (s *Service) ExportProviderCredentials(ctx context.Context, providerValue accountdomain.Provider) (ExportResult, error) {
+	if !providerValue.IsValid() {
+		return ExportResult{}, invalidInput("账号来源无效")
+	}
+	if s.providers == nil {
+		return ExportResult{}, fmt.Errorf("Provider 注册表未初始化")
+	}
+	adapter, ok := s.providers.CredentialCodec(providerValue)
 	if !ok {
-		return ExportResult{}, fmt.Errorf("CLI Provider 未注册")
+		return ExportResult{}, fmt.Errorf("Provider %s 不支持凭据导出", providerValue)
 	}
 	values, total, err := s.accounts.List(ctx, repository.AccountListQuery{
 		Page:   repository.PageQuery{Limit: maxCredentialExportAccounts + 1},
-		Filter: repository.AccountListFilter{Provider: string(accountdomain.ProviderBuild), Now: s.now()},
+		Filter: repository.AccountListFilter{Provider: string(providerValue), Now: s.now()},
 	})
 	if err != nil {
 		return ExportResult{}, err
@@ -1261,23 +1448,40 @@ func (s *Service) ExportCredentials(ctx context.Context) (ExportResult, error) {
 	}
 	seeds := make([]provider.CredentialSeed, 0, len(values))
 	for _, value := range values {
-		if value.Provider != accountdomain.ProviderBuild {
+		if value.Provider != providerValue {
 			continue
 		}
-		accessToken, err := s.cipher.Decrypt(value.EncryptedAccessToken)
-		if err != nil {
-			return ExportResult{}, fmt.Errorf("解密账号 %d access token: %w", value.ID, err)
+		accessToken := ""
+		if value.EncryptedAccessToken != "" {
+			accessToken, err = s.cipher.Decrypt(value.EncryptedAccessToken)
+			if err != nil {
+				return ExportResult{}, fmt.Errorf("解密账号 %d access token: %w", value.ID, err)
+			}
 		}
-		refreshToken, err := s.cipher.Decrypt(value.EncryptedRefreshToken)
-		if err != nil {
-			return ExportResult{}, fmt.Errorf("解密账号 %d refresh token: %w", value.ID, err)
+		refreshToken := ""
+		if value.EncryptedRefreshToken != "" {
+			refreshToken, err = s.cipher.Decrypt(value.EncryptedRefreshToken)
+			if err != nil {
+				return ExportResult{}, fmt.Errorf("解密账号 %d refresh token: %w", value.ID, err)
+			}
+		}
+		cloudflareCookies := ""
+		if value.EncryptedCloudflareCookie != "" {
+			cloudflareCookies, err = s.cipher.Decrypt(value.EncryptedCloudflareCookie)
+			if err != nil {
+				return ExportResult{}, fmt.Errorf("解密账号 %d Cloudflare Cookie: %w", value.ID, err)
+			}
 		}
 		if accessToken == "" && refreshToken == "" {
-			return ExportResult{}, fmt.Errorf("账号 %d 没有可导出的 OAuth 凭据", value.ID)
+			return ExportResult{}, fmt.Errorf("账号 %d 没有可导出的凭据", value.ID)
 		}
 		seeds = append(seeds, provider.CredentialSeed{
+			Provider: value.Provider, AuthType: value.AuthType, WebTier: value.WebTier,
 			Name: value.Name, Email: value.Email, UserID: value.UserID, TeamID: value.TeamID,
-			OIDCClientID: value.OIDCClientID, AccessToken: accessToken, RefreshToken: refreshToken, ExpiresAt: value.ExpiresAt,
+			OIDCClientID: value.OIDCClientID, AccessToken: accessToken, RefreshToken: refreshToken,
+			CloudflareCookies: cloudflareCookies, ExpiresAt: value.ExpiresAt,
+			WebNSFWEnabledAt: value.WebNSFWEnabledAt, WebTermsAcceptedAt: value.WebTermsAcceptedAt,
+			WebTermsAcceptedVersion: value.WebTermsAcceptedVersion, WebBirthDateSetAt: value.WebBirthDateSetAt,
 		})
 	}
 	data, err := adapter.MarshalCredentials(seeds)
@@ -1337,6 +1541,21 @@ func (s *Service) Update(ctx context.Context, id uint64, input UpdateInput) (Vie
 			value.EncryptedCloudflareCookie = encrypted
 		}
 	}
+	if input.BuildSuperEntitled != nil {
+		if value.Provider != accountdomain.ProviderBuild {
+			return View{}, invalidInput("仅 Grok Build 账号支持设置 Build Super entitlement")
+		}
+		value.BuildSuperEntitled = *input.BuildSuperEntitled
+	}
+	if input.BuildRouteMode != nil {
+		if value.Provider != accountdomain.ProviderBuild {
+			return View{}, invalidInput("仅 Grok Build 账号支持设置上游地址")
+		}
+		if !input.BuildRouteMode.IsValid() {
+			return View{}, invalidInput("Build 上游地址必须是 auto、build 或 xai")
+		}
+		value.BuildRouteMode = *input.BuildRouteMode
+	}
 	updated, err := s.accounts.Update(ctx, value)
 	if err != nil {
 		return View{}, mapRepositoryError(err)
@@ -1354,22 +1573,16 @@ func (s *Service) MarkBuildAPIFallback(ctx context.Context, id uint64, enabled b
 	return mapRepositoryError(s.accounts.MarkBuildAPIFallback(ctx, id, enabled))
 }
 
-// CanUseBuildAPIFallback 仅允许 Billing 已确认付费的 Build 账号访问 XAI 回退地址。
-// 缺失或读取失败的 Billing 按无资格处理，由调用方 fail closed。
-func (s *Service) CanUseBuildAPIFallback(ctx context.Context, id uint64) (bool, error) {
-	billing, err := s.accounts.GetBilling(ctx, id)
-	if err != nil {
-		return false, mapRepositoryError(err)
-	}
-	return billing.IsPaid(), nil
-}
-
 func (s *Service) Delete(ctx context.Context, id uint64) error {
 	if s.sticky != nil {
 		_ = s.sticky.DeleteByAccount(ctx, id)
 	}
 	s.clearRefreshState(id)
-	return mapRepositoryError(s.accounts.Delete(ctx, id))
+	err := s.accounts.Delete(ctx, id)
+	if err == nil {
+		s.invalidateBuildBotFlagCache()
+	}
+	return mapRepositoryError(err)
 }
 
 func (s *Service) MarkReauthRequired(ctx context.Context, id uint64, reason string) error {
@@ -1387,6 +1600,21 @@ func (s *Service) MarkReauthRequired(ctx context.Context, id uint64, reason stri
 	}
 	if s.sticky != nil {
 		_ = s.sticky.DeleteByAccount(ctx, id)
+	}
+	return nil
+}
+
+// markSSOCredentialRejected 在上游明确返回 401 后可靠持久化失效状态。
+// 状态写入不继承客户端取消，避免已经确认失效的账号因请求断开继续留在号池。
+func (s *Service) markSSOCredentialRejected(ctx context.Context, value accountdomain.Credential, reason string) error {
+	if value.AuthType != accountdomain.AuthTypeSSO {
+		return nil
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialStateWriteTimeout)
+	defer cancel()
+	if err := s.MarkReauthRequired(writeCtx, value.ID, reason); err != nil {
+		s.logger.Error("account_reauth_required_write_failed", "account_id", value.ID, "provider", value.Provider, "error", err)
+		return err
 	}
 	return nil
 }
@@ -1486,6 +1714,7 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 		if err != nil {
 			return nil, err
 		}
+		s.invalidateBuildBotFlagCache()
 		s.markRefreshSuccess(latest.ID, currentTime)
 		s.WakeCredentialRefresh()
 		return updated, nil
@@ -1835,7 +2064,7 @@ func (s *Service) refreshQuota(ctx context.Context, id uint64) ([]accountdomain.
 	snapshot, err := adapter.SyncQuota(ctx, value)
 	if err != nil {
 		if errors.Is(err, provider.ErrUnauthorized) {
-			_ = s.MarkReauthRequired(ctx, id, fmt.Sprintf("%s SSO credential rejected", value.Provider))
+			err = errors.Join(err, s.markSSOCredentialRejected(ctx, value, fmt.Sprintf("%s SSO credential rejected", value.Provider)))
 		}
 		return nil, err
 	}
@@ -1855,6 +2084,18 @@ func (s *Service) refreshQuota(ctx context.Context, id uint64) ([]accountdomain.
 			if err := s.quotaQueue.ScheduleQuotaRecovery(ctx, accountdomain.QuotaRecoveryEvent{AccountID: id, Mode: window.Mode, DueAt: *window.ResetAt}); err != nil {
 				return snapshot.Windows, fmt.Errorf("安排额度恢复事件: %w", err)
 			}
+		}
+	}
+	// 身份补全是非关键操作：只在额度落库和恢复任务调度完成后执行，
+	// 并沿用调用方取消语义，不能反向影响额度同步结果。
+	if (value.Provider == accountdomain.ProviderWeb || value.Provider == accountdomain.ProviderConsole) && ctx.Err() == nil {
+		if strings.TrimSpace(value.UserID) == "" && strings.TrimSpace(value.Email) == "" {
+			if identityErr := s.syncAccountIdentityBestEffort(ctx, id); errors.Is(identityErr, provider.ErrUnauthorized) {
+				return snapshot.Windows, identityErr
+			}
+		} else {
+			// 已有 Session 身份时只做本地增量关联，不再访问上游。
+			s.reconcileProviderLinksBestEffort(ctx, id)
 		}
 	}
 	return snapshot.Windows, nil
@@ -1931,7 +2172,7 @@ func (s *Service) refreshQuotaMode(ctx context.Context, id uint64, mode string) 
 	window, err := adapter.SyncQuotaMode(ctx, value, mode)
 	if err != nil {
 		if errors.Is(err, provider.ErrUnauthorized) {
-			_ = s.MarkReauthRequired(ctx, id, fmt.Sprintf("%s SSO credential rejected", value.Provider))
+			err = errors.Join(err, s.markSSOCredentialRejected(ctx, value, fmt.Sprintf("%s SSO credential rejected", value.Provider)))
 		}
 		return accountdomain.QuotaWindow{}, err
 	}
@@ -2214,6 +2455,31 @@ func (s *Service) refreshTokens(ctx context.Context, ids []uint64, progress Batc
 	})
 }
 
+// BatchRefreshTokens 续期指定账号的凭据；停用、失效或缺少刷新凭据的账号会被跳过。
+func (s *Service) BatchRefreshTokens(ctx context.Context, ids []uint64) (int, int, int, error) {
+	values, err := normalizeBatchIDs(ids)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if s.providers == nil {
+		return 0, 0, 0, fmt.Errorf("Provider 注册表未初始化")
+	}
+	refreshableIDs := make([]uint64, 0, len(values))
+	for _, id := range values {
+		value, getErr := s.accounts.Get(ctx, id)
+		if getErr != nil {
+			return 0, 0, 0, getErr
+		}
+		if !s.providers.SupportsCredentialRefresh(value.Provider) || !value.Enabled || value.AuthStatus != accountdomain.AuthStatusActive || value.EncryptedRefreshToken == "" {
+			continue
+		}
+		refreshableIDs = append(refreshableIDs, id)
+	}
+	skipped := len(values) - len(refreshableIDs)
+	succeeded, failed, err := s.refreshTokens(ctx, refreshableIDs, nil)
+	return succeeded, failed, skipped, err
+}
+
 // BatchRefreshBilling 使用有限并发刷新选中账号，避免大量账号同步时串行阻塞或无界创建 goroutine。
 func (s *Service) BatchRefreshBilling(ctx context.Context, ids []uint64) (int, int, error) {
 	values, err := normalizeBatchIDs(ids)
@@ -2288,6 +2554,7 @@ func (s *Service) persistSeed(ctx context.Context, seed provider.CredentialSeed)
 	}
 	stored, created, err := s.accounts.UpsertByIdentity(ctx, value)
 	if err == nil {
+		s.invalidateBuildBotFlagCache()
 		s.WakeCredentialRefresh()
 	}
 	return stored, created, err
@@ -2332,25 +2599,19 @@ func (s *Service) credentialFromSeed(seed provider.CredentialSeed) (accountdomai
 		}
 		authType = definition.Credential.AuthType
 	}
-	value := accountdomain.Credential{Provider: providerValue, AuthType: authType, WebTier: seed.WebTier, Name: seed.Name, Email: seed.Email, UserID: seed.UserID, TeamID: seed.TeamID, SourceKey: sourceKey, OIDCClientID: seed.OIDCClientID, EncryptedAccessToken: accessEncrypted, EncryptedRefreshToken: refreshEncrypted, EncryptedCloudflareCookie: cloudflareEncrypted, ExpiresAt: seed.ExpiresAt, Enabled: true, AuthStatus: accountdomain.AuthStatusActive, Priority: accountdomain.DefaultPriority, MaxConcurrent: accountdomain.DefaultMaxConcurrent, MinimumRemaining: accountdomain.DefaultMinimumRemaining}
+	value := accountdomain.Credential{Provider: providerValue, AuthType: authType, WebTier: seed.WebTier, Name: seed.Name, Email: seed.Email, UserID: seed.UserID, TeamID: seed.TeamID, SourceKey: sourceKey, OIDCClientID: seed.OIDCClientID, EncryptedAccessToken: accessEncrypted, EncryptedRefreshToken: refreshEncrypted, EncryptedCloudflareCookie: cloudflareEncrypted, ExpiresAt: seed.ExpiresAt, Enabled: true, AuthStatus: accountdomain.AuthStatusActive, Priority: accountdomain.DefaultPriority, MaxConcurrent: accountdomain.DefaultMaxConcurrent, MinimumRemaining: accountdomain.DefaultMinimumRemaining, WebNSFWEnabledAt: seed.WebNSFWEnabledAt, WebTermsAcceptedAt: seed.WebTermsAcceptedAt, WebTermsAcceptedVersion: seed.WebTermsAcceptedVersion, WebBirthDateSetAt: seed.WebBirthDateSetAt}
+	if providerValue == accountdomain.ProviderWeb && strings.TrimSpace(seed.AccessToken) != "" {
+		value.EgressIdentity = "sso_" + security.HashToken(seed.AccessToken)[:32]
+	}
 	return value, nil
 }
 
 func normalizePage(page, pageSize int) (int, int) {
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 {
-		pageSize = 20
-	}
-	if pageSize > 100 {
-		pageSize = 100
-	}
-	return page, pageSize
+	return repository.NormalizePage(page, pageSize, repository.DefaultPageSize)
 }
 
 func normalizeBatchIDs(ids []uint64) ([]uint64, error) {
-	return normalizeIDs(ids, 500)
+	return normalizeIDs(ids, repository.MaxPageSize)
 }
 
 func normalizeIDs(ids []uint64, limit int) ([]uint64, error) {
@@ -2384,6 +2645,9 @@ func invalidInput(message string) error {
 func mapRepositoryError(err error) error {
 	if errors.Is(err, repository.ErrNotFound) {
 		return ErrNotFound
+	}
+	if errors.Is(err, repository.ErrConflict) {
+		return fmt.Errorf("%w: %s", ErrConflict, strings.TrimPrefix(err.Error(), repository.ErrConflict.Error()+": "))
 	}
 	return err
 }

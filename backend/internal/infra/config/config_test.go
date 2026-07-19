@@ -48,6 +48,12 @@ bootstrapAdmin:
 	if cfg.Batch.ImportConcurrency != 25 || cfg.Batch.ConversionConcurrency != 25 || cfg.Batch.SyncConcurrency != 25 || cfg.Batch.RefreshConcurrency != 25 || cfg.Batch.RandomDelay.Value() != 500*time.Millisecond {
 		t.Fatalf("batch defaults = %#v", cfg.Batch)
 	}
+	if cfg.Routing.PreferFreeBuild {
+		t.Fatal("preferFreeBuild should retain its false default when omitted from YAML")
+	}
+	if !cfg.Routing.ReasoningReplayEnabled || cfg.Routing.ReasoningReplayTTL.Value() != time.Hour || cfg.Routing.ReasoningReplayMaxEntries != 10240 {
+		t.Fatalf("reasoning replay defaults = %#v", cfg.Routing)
+	}
 	expectedDatabasePath := filepath.Join(dir, "data", "backend.db")
 	if cfg.Database.SQLite.Path != expectedDatabasePath {
 		t.Fatalf("database path = %q, want %q", cfg.Database.SQLite.Path, expectedDatabasePath)
@@ -64,13 +70,13 @@ bootstrapAdmin:
 
 func TestDefaultGrokBuildClientVersionMatchesLocalBaseline(t *testing.T) {
 	build := defaultConfig().Provider.Build
-	if RecommendedBuildClientVersion != "0.2.101" {
+	if RecommendedBuildClientVersion != "0.2.103" {
 		t.Fatalf("recommended clientVersion = %q", RecommendedBuildClientVersion)
 	}
 	if build.ClientVersion != RecommendedBuildClientVersion {
 		t.Fatalf("clientVersion = %q", build.ClientVersion)
 	}
-	if RecommendedBuildUserAgent != "grok-shell/0.2.101 (linux; x86_64)" {
+	if RecommendedBuildUserAgent != "grok-shell/0.2.103 (linux; x86_64)" {
 		t.Fatalf("recommended userAgent = %q", RecommendedBuildUserAgent)
 	}
 	if build.UserAgent != RecommendedBuildUserAgent {

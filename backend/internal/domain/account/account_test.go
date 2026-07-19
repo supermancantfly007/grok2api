@@ -14,20 +14,62 @@ func TestBillingIsPaidMatchesSQLSignals(t *testing.T) {
 		{OnDemandCap: 0.01},
 		{OnDemandUsed: 1},
 		{PrepaidBalance: 5},
-		{CreditUsagePercent: 0.1},
+		{PlanName: "SuperGrok"},
+		{PlanName: "SuperGrok Heavy"},
+		{PlanCode: "supergrok_lite"},
+		{PlanName: "X Premium+"},
 	} {
 		if !billing.IsPaid() {
 			t.Fatalf("expected paid for %#v", billing)
 		}
 	}
-	if (Billing{Used: 100, PlanName: "free"}).IsPaid() {
-		t.Fatal("usage/plan name alone must not mark paid")
+	if (Billing{Used: 100, CreditUsagePercent: 42.5, PlanName: "free"}).IsPaid() {
+		t.Fatal("usage percentage must not mark a Free account as paid")
+	}
+	if (Billing{CreditUsagePercent: 42.5}).IsPaid() {
+		t.Fatal("usage percentage without a subscription tier must remain unknown")
+	}
+	if (Billing{IsUnifiedBillingUser: true, UsagePeriodType: "USAGE_PERIOD_TYPE_WEEKLY"}).HasFreeProfileSignal() {
+		t.Fatal("generic weekly billing fields must not mark an account as free")
+	}
+	if !(Billing{PlanName: "Free"}).HasFreeProfileSignal() || !(Billing{PlanCode: "x_basic"}).HasFreeProfileSignal() {
+		t.Fatal("known restricted tiers should be recognized as free/basic")
+	}
+}
+
+func TestBuildRouteModeValidation(t *testing.T) {
+	for _, value := range []BuildRouteMode{BuildRouteAuto, BuildRouteBuild, BuildRouteXAI} {
+		if !value.IsValid() {
+			t.Fatalf("valid route mode rejected: %q", value)
+		}
+	}
+	for _, value := range []BuildRouteMode{"", "primary", "fallback"} {
+		if value.IsValid() {
+			t.Fatalf("invalid route mode accepted: %q", value)
+		}
+	}
+}
+
+func TestIsBuildSuper(t *testing.T) {
+	paid := Billing{MonthlyLimit: 100}
+	zeroFree := Billing{IsUnifiedBillingUser: true}
+	if !IsBuildSuper(Credential{Provider: ProviderBuild, BuildSuperEntitled: true}, &zeroFree) {
+		t.Fatal("entitlement must make zero-billing Build Super")
+	}
+	if !IsBuildSuper(Credential{Provider: ProviderBuild}, &paid) {
+		t.Fatal("paid billing must make Build Super")
+	}
+	if IsBuildSuper(Credential{Provider: ProviderBuild}, &zeroFree) {
+		t.Fatal("zero billing without entitlement is not Super")
+	}
+	if IsBuildSuper(Credential{Provider: ProviderWeb, BuildSuperEntitled: true}, &paid) {
+		t.Fatal("Web must ignore BuildSuperEntitled")
 	}
 }
 
 func TestRoutingCandidateIsKnownFreeBuild(t *testing.T) {
-	freeBilling := Billing{IsUnifiedBillingUser: true}
-	paidBilling := Billing{MonthlyLimit: 100}
+	freeBilling := Billing{PlanName: "Free"}
+	paidBilling := Billing{PlanName: "SuperGrok"}
 	freeRecovery := QuotaRecovery{Kind: QuotaRecoveryKindFree}
 	tests := []struct {
 		name      string
@@ -35,9 +77,13 @@ func TestRoutingCandidateIsKnownFreeBuild(t *testing.T) {
 		want      bool
 	}{
 		{name: "billing profile", candidate: RoutingCandidate{Credential: Credential{Provider: ProviderBuild}, Billing: &freeBilling}, want: true},
+		{name: "ambiguous weekly profile", candidate: RoutingCandidate{Credential: Credential{Provider: ProviderBuild}, Billing: &Billing{IsUnifiedBillingUser: true, UsagePeriodType: "USAGE_PERIOD_TYPE_WEEKLY"}}},
 		{name: "observed response model", candidate: RoutingCandidate{Credential: Credential{Provider: ProviderBuild, ObservedModel: "grok-4.5-build-free"}}, want: true},
 		{name: "quota recovery", candidate: RoutingCandidate{Credential: Credential{Provider: ProviderBuild}, QuotaRecovery: &freeRecovery}, want: true},
 		{name: "paid overrides stale free signal", candidate: RoutingCandidate{Credential: Credential{Provider: ProviderBuild, ObservedModel: "grok-4.5-build-free"}, Billing: &paidBilling}},
+		{name: "entitlement overrides free profile", candidate: RoutingCandidate{Credential: Credential{Provider: ProviderBuild, BuildSuperEntitled: true}, Billing: &freeBilling}},
+		{name: "entitlement overrides free recovery", candidate: RoutingCandidate{Credential: Credential{Provider: ProviderBuild, BuildSuperEntitled: true}, QuotaRecovery: &freeRecovery}},
+		{name: "entitlement overrides observed free model", candidate: RoutingCandidate{Credential: Credential{Provider: ProviderBuild, BuildSuperEntitled: true, ObservedModel: "grok-4.5-build-free"}}},
 		{name: "unknown build", candidate: RoutingCandidate{Credential: Credential{Provider: ProviderBuild}}},
 		{name: "web is never build free", candidate: RoutingCandidate{Credential: Credential{Provider: ProviderWeb, ObservedModel: "grok-4.5-build-free"}}},
 	}

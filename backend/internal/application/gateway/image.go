@@ -197,6 +197,14 @@ func (s *Service) executeImage(
 		response, err = execute(ctx, route.Provider, credential, route.UpstreamModel)
 		if err != nil {
 			s.logger.Error("image_upstream_failed", "event_id", eventID, "request_id", requestID, "model", externalModel, "provider", route.Provider, "account_id", credential.ID, "error", err)
+			if isSSOCredentialRejected(err, credential) {
+				s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+				failedCredential := credential
+				lastCredentialFailure = &failedCredential
+				lastCredentialError = provider.ErrUnauthorized
+				lease.Release()
+				continue
+			}
 			if !provider.IsMediaPostProcessingError(err) {
 				s.selector.MarkFailure(ctx, credential, 0, 0)
 			}
@@ -207,6 +215,16 @@ func (s *Service) executeImage(
 			}
 			writeFailureAudit(http.StatusBadGateway, errorCode, &credential)
 			return nil, err
+		}
+		if response.StatusCode == http.StatusUnauthorized && credential.AuthType == accountdomain.AuthTypeSSO {
+			_, _ = readRetryableBody(response.Body)
+			s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+			failedCredential := credential
+			lastCredentialFailure = &failedCredential
+			lastCredentialError = provider.ErrUnauthorized
+			response = nil
+			lease.Release()
+			continue
 		}
 		if s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden && egressRetries+1 < maxAttempts {
 			_, _ = readRetryableBody(response.Body)
@@ -227,13 +245,6 @@ func (s *Service) executeImage(
 			}
 		}
 		if response.StatusCode == http.StatusUnauthorized {
-			if credential.AuthType == accountdomain.AuthTypeSSO {
-				s.excludeUnavailableAccount(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
-				_, _ = readRetryableBody(response.Body)
-				lease.Release()
-				response = nil
-				continue
-			}
 			if s.providers.SupportsCredentialRefresh(credential.Provider) && credential.EncryptedRefreshToken != "" {
 				refreshed, refreshErr := s.accounts.EnsureCredential(ctx, credential, true)
 				if refreshErr == nil {

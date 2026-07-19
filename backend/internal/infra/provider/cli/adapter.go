@@ -24,6 +24,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/pkg/reasoningreplay"
 )
 
 type Config struct {
@@ -34,6 +35,8 @@ type Config struct {
 	TokenAuth        string
 	UserAgent        string
 }
+
+const subscriptionTierTimeout = 10 * time.Second
 
 // Adapter 实现 Grok Build CLI Responses、模型、Billing 与 OAuth 协议。
 type Adapter struct {
@@ -48,6 +51,8 @@ type Adapter struct {
 	modelsETags    map[uint64]string
 	fallbackMarker FallbackMarker
 	uploadIssuer   VideoUploadIssuer
+	replay         *reasoningreplay.ReasoningReplay
+	compaction     *gatewayCompactionCodec
 }
 
 func NewAdapter(cfg Config, cipher *security.Cipher) *Adapter {
@@ -58,7 +63,7 @@ func NewAdapter(cfg Config, cipher *security.Cipher) *Adapter {
 	agentID := uuid.NewString()
 	return &Adapter{
 		cfg: cfg, http: httpClient, oauth: newOAuthClient(httpClient), cipher: cipher, base: transport,
-		agentID: agentID, modelsETags: make(map[uint64]string),
+		agentID: agentID, modelsETags: make(map[uint64]string), compaction: newGatewayCompactionCodec(cipher),
 	}
 }
 
@@ -68,7 +73,26 @@ func (a *Adapter) SetEgress(manager *infraegress.Manager) {
 	}
 }
 
+// SetReasoningReplay 注入服务端推理回放缓存（可选）。
+func (a *Adapter) SetReasoningReplay(replay *reasoningreplay.ReasoningReplay) {
+	a.replay = replay
+}
+
 func (a *Adapter) Provider() account.Provider { return account.ProviderBuild }
+
+// CredentialMetadata 只从 Build access token 提取非敏感风险标记。
+// bot_flag_source 必须是 JSON 数字 1；其他值、畸形 token 或解密失败均不标记。
+func (a *Adapter) CredentialMetadata(credential account.Credential) provider.CredentialMetadata {
+	if credential.Provider != account.ProviderBuild || a.cipher == nil || credential.EncryptedAccessToken == "" {
+		return provider.CredentialMetadata{}
+	}
+	accessToken, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
+	if err != nil {
+		return provider.CredentialMetadata{}
+	}
+	value, ok := decodeJWTClaims(accessToken)["bot_flag_source"].(float64)
+	return provider.CredentialMetadata{BuildBotFlagged: ok && value == 1}
+}
 
 func (a *Adapter) UpdateConfig(cfg Config) {
 	a.cfgMu.Lock()
@@ -90,37 +114,73 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	body := request.Body
 	var toolCompatibility *responsesToolCompatibility
 	var conversationOptions conversation.ResponseOptions
+	compactionRequested := false
 	if request.NormalizeBody {
 		if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
 			body, conversationOptions, err = conversation.ConvertRequestWithOptions(body, request.Model, request.Operation)
 		} else {
+			var foreignCompactions int
+			body, foreignCompactions, err = expandGatewayCompactionHistory(body, a.compaction, request.PromptCacheKey)
+			if err != nil {
+				return invalidResponsesResponse(err), nil
+			}
 			body, toolCompatibility, err = normalizeResponsesRequest(body, request.Model)
+			if toolCompatibility != nil {
+				compactionRequested = toolCompatibility.compactionRequested
+				if foreignCompactions > 0 {
+					toolCompatibility.addWarning("foreign_compaction_omitted")
+				}
+			}
 		}
 		if err != nil {
 			if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
 				return invalidConversationResponse(request.Operation, err), nil
 			}
+			return invalidResponsesResponse(err), nil
+		}
+	}
+	if compactionRequested {
+		body, err = prepareGatewayCompactionSample(body)
+		if err != nil {
 			return invalidResponsesResponse(err), nil
 		}
 	}
 	if len(body) > 0 && request.Method == http.MethodPost {
-		body, err = injectPromptCacheKey(body, request.PromptCacheKey)
-		if err != nil {
-			err = fmt.Errorf("写入 prompt_cache_key: %w", err)
-			if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
-				return invalidConversationResponse(request.Operation, err), nil
+		if !compactionRequested {
+			body, err = injectPromptCacheKey(body, request.PromptCacheKey)
+			if err != nil {
+				err = fmt.Errorf("写入 prompt_cache_key: %w", err)
+				if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
+					return invalidConversationResponse(request.Operation, err), nil
+				}
+				return invalidResponsesResponse(err), nil
 			}
-			return invalidResponsesResponse(err), nil
+		}
+		// 服务端推理回放：在 prompt_cache_key 写入后、出站前注入上一轮 encrypted items。
+		if a.replay != nil && request.PromptCacheKey != "" && !isCompactPath(request.Path) && !compactionRequested {
+			body = a.replay.Apply(ctx, request.Model, request.PromptCacheKey, body)
 		}
 	}
-	// 推理回退：create/compact 可走 XAI；stored GET/DELETE 与未知路径始终主地址。
-	base := a.apiBaseForOperation(ctx, request.Credential, request.Method, request.Path)
+	if compactionRequested {
+		warnings := ""
+		if toolCompatibility != nil {
+			warnings = toolCompatibility.warningHeader()
+		}
+		return a.forwardGatewayCompaction(ctx, request, accessToken, body, warnings)
+	}
+	// 显式模式优先；auto 下仅已确认 Super 且 bot_flag_source=1 的账号默认走 XAI。
+	primaryBase := a.primaryBaseURL()
+	base := a.inferenceBaseForOperation(request.Credential, request.Billing, request.Method, request.Path)
 	resp, reqURL, err := a.doResponseRequest(ctx, request, accessToken, body, base)
 	if err != nil {
 		return nil, err
 	}
-	// 未标记账号：仅可回退操作在主地址明确 403 时用等价请求探测 XAI。
-	if a.shouldProbeXAIInferenceFallback(ctx, request.Credential, request.Method, request.Path, resp.StatusCode) {
+	if err := normalizeGzipResponse(resp); err != nil {
+		return nil, err
+	}
+	resp, reqURL, reasoningRecovered := a.recoverReasoningDecodeFailure(ctx, request, accessToken, body, base, resp, reqURL)
+	// 仅可回退操作在当次 Build 主地址明确 403 时用等价请求探测 XAI。
+	if strings.EqualFold(base, primaryBase) && shouldProbeXAIInferenceFallback(request.Credential, request.Billing, request.Method, request.Path, resp.StatusCode) {
 		// 缓冲主 403 正文，备用失败时原样回放，避免二次 primary POST。
 		primaryBody, primaryTruncated, readErr := provider.ReadDiagnosticBody(resp.Body)
 		_ = resp.Body.Close()
@@ -131,9 +191,17 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		fallbackBase := a.fallbackBaseURL()
 		if fallbackBase != "" && !strings.EqualFold(fallbackBase, base) {
 			fallbackResp, fallbackURL, fallbackErr := a.doResponseRequest(ctx, request, accessToken, body, fallbackBase)
+			if fallbackErr == nil {
+				fallbackErr = normalizeGzipResponse(fallbackResp)
+			}
+			fallbackRecovered := false
+			if fallbackErr == nil {
+				fallbackResp, fallbackURL, fallbackRecovered = a.recoverReasoningDecodeFailure(ctx, request, accessToken, body, fallbackBase, fallbackResp, fallbackURL)
+			}
 			if fallbackErr == nil && isHTTPSuccess(fallbackResp.StatusCode) {
 				a.activateBuildAPIFallback(ctx, &request.Credential)
-				resp, reqURL = fallbackResp, fallbackURL
+				resp, reqURL, base = fallbackResp, fallbackURL, fallbackBase
+				reasoningRecovered = reasoningRecovered || fallbackRecovered
 			} else {
 				if fallbackErr == nil {
 					_ = fallbackResp.Body.Close()
@@ -145,16 +213,19 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			resp = primaryResp
 		}
 	}
-
-	if err := normalizeGzipResponse(resp); err != nil {
-		return nil, err
-	}
 	modelCatalogChanged := a.modelCatalogChanged(request.Credential.ID, resp.Header.Get("x-models-etag"))
-	responsesOperation := request.Operation == "" || request.Operation == conversation.OperationResponses
+	// 在协议转换前捕获上游 Responses 形态，写入/清理推理回放缓存。
+	if a.shouldCaptureReplay(request, resp) {
+		resp.Body = a.replay.CaptureBody(resp.Body, request.Model, request.PromptCacheKey, request.Streaming, isCompactPath(request.Path))
+	}
+	responsesOperation := request.Operation == "" || request.Operation == conversation.OperationResponses || request.Operation == conversation.OperationCompaction
 	if responsesOperation && toolCompatibility != nil {
 		if warnings := toolCompatibility.warningHeader(); warnings != "" {
 			resp.Header.Set("X-Grok2API-Compatibility-Warnings", warnings)
 		}
+	}
+	if reasoningRecovered {
+		appendCompatibilityWarning(resp.Header, "reasoning_encrypted_content_downgraded")
 	}
 	if responsesOperation && toolCompatibility != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if request.Streaming {
@@ -220,12 +291,29 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, ModelCatalogChanged: modelCatalogChanged}, nil
 }
 
+func (a *Adapter) shouldCaptureReplay(request provider.ResponseResourceRequest, resp *http.Response) bool {
+	if a.replay == nil || !a.replay.Enabled() || resp == nil {
+		return false
+	}
+	if request.Method != http.MethodPost || strings.TrimSpace(request.PromptCacheKey) == "" {
+		return false
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false
+	}
+	return true
+}
+
+func isCompactPath(path string) bool {
+	return strings.Contains(strings.ToLower(path), "compact")
+}
+
 func (a *Adapter) doResponseRequest(ctx context.Context, request provider.ResponseResourceRequest, accessToken string, body []byte, base string) (*http.Response, string, error) {
 	var bodyReader io.Reader
 	if len(body) > 0 {
 		bodyReader = bytes.NewReader(body)
 	}
-	requestCtx := infraegress.WithAccount(ctx, string(account.ProviderBuild), request.Credential.ID)
+	requestCtx := infraegress.WithCredential(ctx, request.Credential)
 	req, err := http.NewRequestWithContext(requestCtx, request.Method, a.urlWithBase(base, request.Path), bodyReader)
 	if err != nil {
 		return nil, "", err
@@ -293,30 +381,8 @@ func (a *Adapter) ListModels(ctx context.Context, credential account.Credential)
 	if err != nil {
 		return nil, err
 	}
-	// Super 的 Build 与 XAI 模型资格一致，统一以 XAI 目录作为能力快照。
-	// BuildAPIFallback 只记录实际推理地址状态，不得把同一批 Super 拆成两套模型能力。
-	super, policyErr := a.buildXAIEntitled(ctx, credential.ID)
-	if policyErr != nil {
-		return nil, fmt.Errorf("查询 Build Super 资格: %w", policyErr)
-	}
-	if super {
-		models, xaiStatus, xaiErr := a.listModelsAt(ctx, credential, accessToken, a.fallbackBaseURL())
-		if models != nil {
-			return models, nil
-		}
-		// Super 任一端可用即视为有效。XAI 目录失败时允许退回 Build 目录；
-		// 两端观察到的模型差异由共享 Super entitlement 在路由层统一。
-		models, buildStatus, buildErr := a.listModelsAt(ctx, credential, accessToken, a.primaryBaseURL())
-		if models != nil {
-			return models, nil
-		}
-		if xaiErr != nil || buildErr != nil {
-			return nil, fmt.Errorf("读取 Super 模型目录失败（XAI status=%d: %v；Build status=%d: %v）", xaiStatus, xaiErr, buildStatus, buildErr)
-		}
-		return nil, fmt.Errorf("上游模型接口返回 XAI %d，Build %d", xaiStatus, buildStatus)
-	}
-
-	// Free/Unknown 仅访问 Build，禁止探测 XAI。
+	// 模型目录始终请求 Build 主地址；不得因目录缺 1.5 或 Super entitlement 预切 XAI。
+	// 1.5 能力由 NormalizeAccountModelCapabilities 按 Billing paid / BuildSuperEntitled 本地补齐。
 	models, status, err := a.listModelsAt(ctx, credential, accessToken, a.primaryBaseURL())
 	if err != nil {
 		return nil, err
@@ -327,10 +393,10 @@ func (a *Adapter) ListModels(ctx context.Context, credential account.Credential)
 	return nil, fmt.Errorf("上游模型接口返回 %d", status)
 }
 
-// NormalizeAccountModelCapabilities 按 Super/paid Billing 归一化 1.5 视频资格。
+// NormalizeAccountModelCapabilities 按 Super（Billing paid 或 BuildSuperEntitled）归一化 1.5 视频资格。
 // Super 确保包含 grok-imagine-video-1.5；Free/Unknown 精确移除。不读取 BuildAPIFallback。
-func (a *Adapter) NormalizeAccountModelCapabilities(models []string, billing *account.Billing) []string {
-	paid := billing != nil && billing.IsPaid()
+func (a *Adapter) NormalizeAccountModelCapabilities(models []string, billing *account.Billing, credential account.Credential) []string {
+	super := account.IsBuildSuper(credential, billing)
 	result := make([]string, 0, len(models)+1)
 	seen := make(map[string]struct{}, len(models)+1)
 	hasVideo15 := false
@@ -343,7 +409,7 @@ func (a *Adapter) NormalizeAccountModelCapabilities(models []string, billing *ac
 			continue
 		}
 		if model == buildVideoModel {
-			if !paid {
+			if !super {
 				continue
 			}
 			hasVideo15 = true
@@ -351,14 +417,14 @@ func (a *Adapter) NormalizeAccountModelCapabilities(models []string, billing *ac
 		seen[model] = struct{}{}
 		result = append(result, model)
 	}
-	if paid && !hasVideo15 {
+	if super && !hasVideo15 {
 		result = append(result, buildVideoModel)
 	}
 	return result
 }
 
 func (a *Adapter) listModelsAt(ctx context.Context, credential account.Credential, accessToken, base string) ([]string, int, error) {
-	requestCtx := infraegress.WithAccount(ctx, string(account.ProviderBuild), credential.ID)
+	requestCtx := infraegress.WithCredential(ctx, credential)
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, a.urlWithBase(base, "/models"), nil)
 	if err != nil {
 		return nil, 0, err
@@ -440,6 +506,13 @@ func (a *Adapter) GetBilling(ctx context.Context, credential account.Credential)
 	if err != nil {
 		return account.Billing{}, err
 	}
+	// 周额度在 0% 使用时无法区分 Free 与刚开通的付费套餐。官方 CLI
+	// 使用 /user?include=subscription 获取实时订阅等级；失败时再退回 JWT tier。
+	if tier, tierErr := a.getSubscriptionTier(ctx, credential, accessToken); tierErr == nil && tier != "" {
+		billing.PlanName = tier
+	} else if billing.PlanCode == "" && billing.PlanName == "" {
+		billing.PlanName = subscriptionTierFromJWT(accessToken)
+	}
 	billing.AccountID = credential.ID
 	billing.SyncedAt = time.Now().UTC()
 	return billing, nil
@@ -453,7 +526,7 @@ func (a *Adapter) RefreshCredential(ctx context.Context, credential account.Cred
 	if strings.TrimSpace(refreshToken) == "" {
 		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "missing_refresh_token", Permanent: true}
 	}
-	refreshCtx := infraegress.WithAccount(ctx, string(account.ProviderBuild), credential.ID)
+	refreshCtx := infraegress.WithCredential(ctx, credential)
 	tokens, err := a.oauth.refresh(refreshCtx, refreshToken)
 	if err != nil {
 		return provider.RefreshedCredential{}, err
@@ -620,7 +693,7 @@ func (a *Adapter) getBilling(ctx context.Context, credential account.Credential,
 	if query != "" {
 		endpoint += "?" + query
 	}
-	requestCtx := infraegress.WithAccount(ctx, string(account.ProviderBuild), credential.ID)
+	requestCtx := infraegress.WithCredential(ctx, credential)
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return account.Billing{}, err
@@ -644,4 +717,33 @@ func (a *Adapter) getBilling(ctx context.Context, credential account.Credential,
 		return account.Billing{}, fmt.Errorf("上游 Billing 接口返回 %d", resp.StatusCode)
 	}
 	return parseBilling(body)
+}
+
+func (a *Adapter) getSubscriptionTier(ctx context.Context, credential account.Credential, accessToken string) (string, error) {
+	endpoint := a.url("/user") + "?include=subscription"
+	requestCtx, cancel := context.WithTimeout(infraegress.WithCredential(ctx, credential), subscriptionTierTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	if err := a.applyHeaders(req, credential, accessToken, "", "", false); err != nil {
+		return "", err
+	}
+	resp, err := a.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	if err := normalizeGzipResponse(resp); err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("上游订阅接口返回 %d", resp.StatusCode)
+	}
+	return parseSubscriptionTier(body)
 }

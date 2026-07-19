@@ -300,7 +300,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	}
 	lastProgress := job.Progress
 	result, err := adapter.GenerateVideo(ctx, provider.VideoRequest{
-		Credential: lease.Credential, JobID: job.ID, Prompt: job.Prompt, Duration: job.Seconds, AspectRatio: job.Size, Resolution: job.Quality,
+		Credential: lease.Credential, Billing: lease.Billing, JobID: job.ID, Prompt: job.Prompt, Duration: job.Seconds, AspectRatio: job.Size, Resolution: job.Quality,
 		ReferenceURLs: decodeVideoInput(job.InputJSON),
 		Progress: func(value int) {
 			value = min(99, max(1, value))
@@ -326,29 +326,27 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		}
 		failureCtx, failureCancel := context.WithTimeout(context.Background(), finalizationTimeout)
 		failureHandled := false
-		if status, ok := provider.ErrorHTTPStatus(err); ok {
+		if errors.Is(err, provider.ErrUnauthorized) {
+			if lease.Credential.AuthType == account.AuthTypeSSO {
+				s.markSSOCredentialRejected(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
+			}
+			failureHandled = true
+		} else if status, ok := provider.ErrorHTTPStatus(err); ok {
 			switch {
-			case status == http.StatusUnauthorized:
-				// 视频任务已绑定账号，不能换号；401 时强制刷新 OAuth，失败则踢出号池。
-				if lease.Credential.AuthType == account.AuthTypeSSO {
-					s.excludeUnavailableAccount(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
-				} else if _, refreshErr := s.accounts.EnsureCredential(failureCtx, lease.Credential, true); refreshErr != nil {
-					s.excludeUnavailableAccount(failureCtx, lease.Credential, fmt.Sprintf("%s OAuth force refresh failed after video 401", lease.Credential.Provider))
-				} else {
-					s.excludeUnavailableAccount(failureCtx, lease.Credential, fmt.Sprintf("%s credential rejected during video job", lease.Credential.Provider))
-				}
+			case status == http.StatusUnauthorized && lease.Credential.AuthType == account.AuthTypeSSO:
+				s.markSSOCredentialRejected(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
 				failureHandled = true
 			case status == http.StatusForbidden && s.providers.RetryForbiddenAsEgress(lease.Credential.Provider):
 				// Web Provider 已对 anti-bot 403 降低出口健康并重建浏览器会话；
 				// 视频请求已提交，不能换号重试，也不能误伤账号池。
-				// Build 主地址 403 的 XAI 推理回退在 Adapter 内完成，不在此禁用账号。
+				// 符合资格的 Build 主地址 403 由 Adapter 尝试 XAI，不在此禁用账号。
 				failureHandled = true
 			case status == http.StatusForbidden && lease.Credential.Provider == account.ProviderBuild:
-				if lease.Billing == nil || !lease.Billing.IsPaid() {
-					// Free/Unknown 不具备 XAI 回退资格；主 Build 403 踢出号池等待人工删除。
-					s.excludeUnavailableAccount(failureCtx, lease.Credential, fmt.Sprintf("Grok Build Free account rejected with HTTP %d", status))
+				if !account.IsBuildSuper(lease.Credential, lease.Billing) {
+					// 非 Super 的 403 按账号级故障处理；auto 模式不会因此回退 XAI。
+					s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
 				}
-				// Super 的 XAI 探测在 Adapter 内完成；其 403 保持服务级处理。
+				// Super（Billing paid 或 entitlement）的 403 保持服务级处理。
 				failureHandled = true
 			case (status == http.StatusPaymentRequired || status == http.StatusTooManyRequests) && lease.QuotaMode != "":
 				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(failureCtx, lease.Credential.ID, lease.QuotaMode, 0)
@@ -364,15 +362,6 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 				s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
 				failureHandled = true
 			}
-		} else if errors.Is(err, provider.ErrUnauthorized) {
-			if lease.Credential.AuthType == account.AuthTypeSSO {
-				s.excludeUnavailableAccount(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
-			} else if _, refreshErr := s.accounts.EnsureCredential(failureCtx, lease.Credential, true); refreshErr != nil {
-				s.excludeUnavailableAccount(failureCtx, lease.Credential, fmt.Sprintf("%s OAuth force refresh failed after video 401", lease.Credential.Provider))
-			} else {
-				s.excludeUnavailableAccount(failureCtx, lease.Credential, fmt.Sprintf("%s credential rejected during video job", lease.Credential.Provider))
-			}
-			failureHandled = true
 		}
 		if !failureHandled && !provider.IsMediaPostProcessingError(err) {
 			s.selector.MarkFailure(failureCtx, lease.Credential, 0, 0)
@@ -388,6 +377,8 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	}
 	now := time.Now().UTC()
 	job.Status, job.Progress, job.UpstreamURL, job.ContentType = media.StatusCompleted, 100, result.URL, result.ContentType
+	// 成功终态必须清空历史错误字段，避免管理端/恢复路径把中间失败文案当成最终结果。
+	job.ErrorCode, job.ErrorMessage = "", ""
 	if result.AssetID != "" {
 		job.ResultAssetID = result.AssetID
 	}
@@ -472,7 +463,11 @@ func (s *Service) reconcileVideoUsage(ctx context.Context) error {
 }
 
 func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationMS int64) error {
-	accountID := job.AccountID
+	var accountID *uint64
+	if job.AccountID > 0 {
+		value := job.AccountID
+		accountID = &value
+	}
 	createdAt := time.Now().UTC()
 	if job.CompletedAt != nil && !job.CompletedAt.IsZero() {
 		createdAt = job.CompletedAt.UTC()
@@ -491,7 +486,7 @@ func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationM
 		EventID: "video_usage_" + job.ID, RequestID: job.RequestID, ClientKeyID: job.ClientKeyID, ClientKeyName: job.ClientKeyName,
 		ModelRouteID: job.ModelRouteID, ModelPublicID: job.Model, ModelUpstreamModel: job.UpstreamModel,
 		Provider: job.Provider, Operation: audit.OperationVideo, UsageSource: audit.UsageSourceNone,
-		AccountID: &accountID, AccountName: job.AccountName, StatusCode: statusCode, ErrorCode: job.ErrorCode,
+		AccountID: accountID, AccountName: job.AccountName, StatusCode: statusCode, ErrorCode: job.ErrorCode,
 		EgressNodeID: job.EgressNodeID, EgressNodeName: job.EgressNodeName, EgressScope: job.EgressScope, EgressMode: audit.EgressMode(job.EgressMode),
 		MediaInputImages: int64(len(decodeVideoInput(job.InputJSON))),
 		DurationMS:       durationMS, CreatedAt: createdAt,

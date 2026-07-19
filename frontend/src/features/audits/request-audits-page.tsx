@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Activity, ArrowDown, ArrowUp, BrainCircuit, CircleCheck, CircleDollarSign, CornerDownRight, Database, Info, RefreshCw, Search, WholeWord, type LucideIcon } from "lucide-react";
+import { Activity, ArrowDown, ArrowUp, BrainCircuit, CircleCheck, CircleDollarSign, CornerDownRight, Database, Info, Minimize2, RefreshCw, Search, WholeWord, type LucideIcon } from "lucide-react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -18,6 +18,7 @@ import { CursorPagination } from "@/shared/components/pagination";
 import { PageHeader } from "@/shared/components/page-header";
 import { PeriodSelector } from "@/shared/components/period-selector";
 import { SortableTableHead } from "@/shared/components/sortable-table-head";
+import { VirtualTableBody } from "@/shared/components/virtual-table-body";
 import { useDebouncedValue } from "@/shared/hooks/use-debounced-value";
 import { cn } from "@/shared/lib/cn";
 import { formatDateTime, formatDuration, formatNumber } from "@/shared/lib/format";
@@ -27,7 +28,7 @@ import { nextTableSort, type SortOrder, type TableSort } from "@/shared/lib/tabl
 export function RequestAuditsPage() {
   const { t, i18n } = useTranslation();
   const [cursors, setCursors] = useState<string[]>([""]);
-  const [pageSize, setPageSize] = useState(50);
+  const [pageSize, setPageSize] = useState(20);
   const [search, setSearch] = useState("");
   const [modelFilter, setModelFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
@@ -159,12 +160,12 @@ export function RequestAuditsPage() {
         {auditsQuery.isError ? <ErrorState message={auditsQuery.error.message} onRetry={() => void auditsQuery.refetch()} /> : null}
         {result && result.items.length === 0 ? <EmptyState /> : null}
         {auditsQuery.isPending || (result && result.items.length > 0) ? (
-          <Table className="min-w-[1136px] table-fixed text-xs">
+          <Table viewportRows={20} rowHeight={72} className="min-w-[1136px] table-fixed text-xs">
             <colgroup>
-              <col className="w-40" />
+              <col className="w-36" />
               <col className="w-44" />
               <col className="w-20" />
-              <col className="w-20" />
+              <col className="w-24" />
               <col className="w-76" />
               <col className="w-20" />
               <col className="w-20" />
@@ -182,8 +183,10 @@ export function RequestAuditsPage() {
                 <SortableTableHead field="createdAt" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort}>{t("audits.createdAt")}</SortableTableHead>
               </TableRow>
             </TableHeader>
-            <TableBody>
-              {auditsQuery.isPending ? <TableLoadingRow colSpan={8} /> : result?.items.map((audit) => (
+            {auditsQuery.isPending ? (
+              <TableBody><TableLoadingRow colSpan={8} /></TableBody>
+            ) : (
+              <VirtualTableBody items={result?.items ?? []} colSpan={8} rowHeight={72} renderRow={(audit) => (
                 <TableRow className="h-[72px]" key={audit.id}>
                   <TableCell><RequestValue audit={audit} /></TableCell>
                   <TableCell>
@@ -201,8 +204,8 @@ export function RequestAuditsPage() {
                   <TableCell className="whitespace-nowrap text-xs tabular-nums">{formatDuration(audit.durationMs)}</TableCell>
                   <TableCell className="whitespace-nowrap text-xs text-muted-foreground">{formatDateTime(audit.createdAt, i18n.language)}</TableCell>
                 </TableRow>
-              ))}
-            </TableBody>
+              )} />
+            )}
           </Table>
         ) : null}
       </DataTableShell>
@@ -338,6 +341,17 @@ function ModelRouteValue({ model, upstreamModel, account, clientKey }: { model: 
 
 function UsageDetails({ audit, locale }: { audit: AuditDTO; locale: string }) {
   const { t } = useTranslation();
+  if (audit.operation === "compaction" && audit.totalTokens === 0) {
+    return (
+      <div className="flex h-[52px] w-full items-center gap-2 rounded-md bg-muted/45 px-2.5 text-[11px]">
+        <Minimize2 className="size-3.5 shrink-0 text-muted-foreground" />
+        <div className="min-w-0">
+          <p className="truncate font-medium">{t("audits.operations.compaction")}</p>
+          <p className="truncate text-muted-foreground">{t("audits.compactionUsageUnavailable")}</p>
+        </div>
+      </div>
+    );
+  }
   if (audit.operation === "video") {
     return <MediaUsage input={t("audits.imageCount", { count: audit.mediaInputImages })} output={t("audits.secondsCount", { count: audit.mediaOutputSeconds })} />;
   }
@@ -385,8 +399,8 @@ function MediaUsage({ input, output }: { input: string; output: string }) {
   );
 }
 
-function StatusCode({ statusCode }: { statusCode: number }) {
-  const tone = statusTone(statusCode);
+function StatusCode({ statusCode, hasError = false }: { statusCode: number; hasError?: boolean }) {
+  const tone = statusTone(statusCode, hasError);
   return (
     <span className={cn("inline-flex items-center gap-1.5 text-xs tabular-nums", tone.text)}>
       <span className={cn("size-1.5 rounded-full", tone.dot)} />
@@ -397,10 +411,10 @@ function StatusCode({ statusCode }: { statusCode: number }) {
 
 function AuditStatus({ audit, onOpen }: { audit: AuditDTO; onOpen: () => void }) {
   const { t } = useTranslation();
-  const mode = audit.streaming ? t("audits.stream") : t("audits.nonStream");
+  const mode = audit.operation === "compaction" ? t("audits.operations.compaction") : audit.streaming ? t("audits.stream") : t("audits.nonStream");
   const content = (
     <>
-      <StatusCode statusCode={audit.statusCode} />
+      <StatusCode statusCode={audit.statusCode} hasError={Boolean(audit.errorCode)} />
       <span className="block whitespace-nowrap text-[10px] text-muted-foreground">{mode}</span>
     </>
   );
@@ -417,7 +431,8 @@ function AuditStatus({ audit, onOpen }: { audit: AuditDTO; onOpen: () => void })
   );
 }
 
-function statusTone(statusCode: number): { dot: string; text: string } {
+function statusTone(statusCode: number, hasError = false): { dot: string; text: string } {
+  if (hasError) return { dot: "bg-amber-500", text: "text-amber-700 dark:text-amber-300" };
   if (statusCode >= 500) return { dot: "bg-red-500", text: "text-red-700 dark:text-red-300" };
   if (statusCode >= 400) return { dot: "bg-amber-500", text: "text-amber-700 dark:text-amber-300" };
   if (statusCode >= 200 && statusCode < 300) return { dot: "bg-emerald-500", text: "text-emerald-700 dark:text-emerald-300" };

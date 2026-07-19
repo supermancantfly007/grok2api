@@ -242,6 +242,9 @@ func (s *Service) UpdateMaxAttempts(maxAttempts int) { s.maxAttempts.Store(int64
 
 func (s *Service) CreateResponse(ctx context.Context, input Input) (*Result, error) {
 	input.Operation = audit.OperationResponses
+	if isResponsesCompactionRequest(input.Body) {
+		input.Operation = audit.OperationCompaction
+	}
 	return s.createResponseAt(ctx, input, "/responses")
 }
 
@@ -258,7 +261,7 @@ func (s *Service) CreateMessage(ctx context.Context, input Input) (*Result, erro
 
 func (s *Service) CompactResponse(ctx context.Context, input Input) (*Result, error) {
 	input.Streaming = false
-	input.Operation = audit.OperationResponses
+	input.Operation = audit.OperationCompaction
 	return s.createResponseAt(ctx, input, "/responses/compact")
 }
 
@@ -479,9 +482,9 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	var lastErr error
 	var lastFailure *UpstreamFailure
 	failureAttempts := newFailureAttemptRecorder(http.MethodPost, path)
-	forwardResponse := func(credential accountdomain.Credential) (*provider.Response, error) {
+	forwardResponse := func(credential accountdomain.Credential, billing *accountdomain.Billing) (*provider.Response, error) {
 		started := time.Now()
-		response, err := adapter.ForwardResponse(ctx, provider.ResponseResourceRequest{Credential: credential, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation)})
+		response, err := adapter.ForwardResponse(ctx, provider.ResponseResourceRequest{Credential: credential, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation)})
 		err = failureAttempts.captureResponse(credential, started, response, err)
 		timing.markUpstream(time.Since(started))
 		return response, err
@@ -555,13 +558,18 @@ attemptLoop:
 			lastFailure = newCredentialUpstreamFailure(err, lease.Credential.ID, lease.Credential.Name)
 			continue
 		}
-		response, err := forwardResponse(credential)
+		response, err := forwardResponse(credential, lease.Billing)
 		if err != nil {
 			lease.Release()
 			lastErr = err
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 				lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
 				break
+			}
+			if isSSOCredentialRejected(err, credential) {
+				s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+				lastFailure = newHTTPUpstreamFailure(http.StatusUnauthorized, nil, credential.ID, credential.Name)
+				continue
 			}
 			lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
 			failureFingerprints[lastFailure.Fingerprint]++
@@ -577,7 +585,7 @@ attemptLoop:
 		if response.StatusCode == http.StatusUnauthorized {
 			response.Body.Close()
 			if credential.AuthType == accountdomain.AuthTypeSSO {
-				s.excludeUnavailableAccount(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+				s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
 				lease.Release()
 				lastErr = fmt.Errorf("%s SSO 凭据已失效", credential.Provider)
 				lastFailure = newHTTPUpstreamFailure(http.StatusUnauthorized, nil, credential.ID, credential.Name)
@@ -593,7 +601,7 @@ attemptLoop:
 			authRecoveryAttempted[credential.ID] = true
 			refreshed, refreshErr := ensureCredential(credential, true)
 			if refreshErr == nil {
-				response, err = forwardResponse(refreshed)
+				response, err = forwardResponse(refreshed, lease.Billing)
 				credential = refreshed
 			}
 			if refreshErr != nil || err != nil {
@@ -638,9 +646,9 @@ attemptLoop:
 				continue
 			}
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
-			freeBuildForbidden := response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild && (lease.Billing == nil || !lease.Billing.IsPaid())
+			// Adapter 仅允许 auto Super 在同请求内回退 XAI；非 Super 的 403 按账号级故障冷却换号。
+			freeBuildForbidden := response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild && !accountdomain.IsBuildSuper(credential, lease.Billing)
 			if freeBuildForbidden {
-				// XAI 不接受 Free 账号。主 Build 403 表示该账号当前不可用，移出号池等待人工处理。
 				lastFailure.AccountScoped = true
 			}
 			if response.StatusCode == http.StatusTooManyRequests && response.RateLimit != nil && response.RateLimit.TeamID != "" && response.RateLimit.Model == route.UpstreamModel {
@@ -668,7 +676,7 @@ attemptLoop:
 					lastFailure = newCredentialUpstreamFailure(refreshErr, credential.ID, credential.Name)
 					continue attemptLoop
 				}
-				response, err = forwardResponse(refreshed)
+				response, err = forwardResponse(refreshed, lease.Billing)
 				credential = refreshed
 				if err != nil {
 					lease.Release()
@@ -746,6 +754,9 @@ attemptLoop:
 				lease.Release()
 				persistCtx, cancel := context.WithTimeout(context.Background(), finalizationTimeout)
 				defer cancel()
+				if isUpstreamStreamFailure(errorCode) {
+					s.selector.MarkFailure(persistCtx, credential, http.StatusBadGateway, 0)
+				}
 				now := time.Now().UTC()
 				record := auditBase
 				record.AccountID = &accountID
@@ -852,6 +863,39 @@ attemptLoop:
 		s.logger.Error("request_usage_write_failed", "event_id", record.EventID, "request_id", input.RequestID, "error", err)
 	}
 	return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, lastErr)
+}
+
+func isUpstreamStreamFailure(errorCode string) bool {
+	switch errorCode {
+	case "upstream_stream_incomplete", "upstream_stream_interrupted":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSSOCredentialRejected(err error, credential accountdomain.Credential) bool {
+	if credential.AuthType != accountdomain.AuthTypeSSO || err == nil {
+		return false
+	}
+	if errors.Is(err, provider.ErrUnauthorized) {
+		return true
+	}
+	status, ok := provider.ErrorHTTPStatus(err)
+	return ok && status == http.StatusUnauthorized
+}
+
+func (s *Service) markSSOCredentialRejected(ctx context.Context, credential accountdomain.Credential, reason string) {
+	if credential.AuthType != accountdomain.AuthTypeSSO {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
+	defer cancel()
+	if err := s.accounts.MarkReauthRequired(writeCtx, credential.ID, reason); err != nil {
+		s.logger.Error("account_reauth_required_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
+	}
+	// 即使持久化失败也立即丢弃本进程的一秒候选快照，避免当前失效账号被下一请求再次选中。
+	s.selector.MarkQuotaStateChanged(credential.Provider)
 }
 
 func (s *Service) queueAccountModelSync(accountID uint64) {
@@ -978,11 +1022,19 @@ func (s *Service) forwardOwnedResponse(ctx context.Context, input ResourceInput,
 	}
 	response, err := adapter.ForwardResponse(ctx, provider.ResponseResourceRequest{Credential: credential, Method: method, Path: path})
 	if err != nil {
+		if isSSOCredentialRejected(err, credential) {
+			s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+		}
 		lease.Release()
 		return nil, err
 	}
 	if response.StatusCode == http.StatusUnauthorized {
 		response.Body.Close()
+		if credential.AuthType == accountdomain.AuthTypeSSO {
+			s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+			lease.Release()
+			return nil, ErrResponseAccountUnavailable
+		}
 		if s.markPermanentlyUnrefreshableCredentialRejected(ctx, credential) {
 			lease.Release()
 			return nil, fmt.Errorf("%w: %w", ErrResponseAccountUnavailable, accountapp.ErrCredentialRefreshPermanent)

@@ -45,11 +45,15 @@ type accountModel struct {
 	ObservedModel    string `gorm:"size:255;check:chk_accounts_observed_model,length(observed_model) <= 255"`
 	ObservedModelAt  *time.Time
 	// BuildAPIFallback 仅对 grok_build 有意义：XAI 推理回退标记；其他 Provider 保持 false。
-	BuildAPIFallback bool                    `gorm:"not null;default:false"`
-	CreatedAt        time.Time               `gorm:"not null"`
-	UpdatedAt        time.Time               `gorm:"not null"`
-	Credential       *accountCredentialModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
-	WebProfile       *webAccountProfileModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	BuildAPIFallback bool `gorm:"not null;default:false"`
+	// BuildRouteMode 仅控制 grok_build 推理地址；其它 Provider 固定 auto。
+	BuildRouteMode string `gorm:"size:16;not null;default:auto;check:chk_accounts_build_route_mode,build_route_mode IN ('auto','build','xai')"`
+	// BuildSuperEntitled 仅对 grok_build 有意义：管理员确认的 Super/1.5 entitlement；其他 Provider 保持 false。
+	BuildSuperEntitled bool                    `gorm:"not null;default:false"`
+	CreatedAt          time.Time               `gorm:"not null"`
+	UpdatedAt          time.Time               `gorm:"not null"`
+	Credential         *accountCredentialModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	WebProfile         *webAccountProfileModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 }
 
 func (accountModel) TableName() string { return "provider_accounts" }
@@ -83,11 +87,26 @@ type accountProviderLinkModel struct {
 
 func (accountProviderLinkModel) TableName() string { return "account_provider_links" }
 
+type webConsoleAccountLinkModel struct {
+	WebAccountID     uint64        `gorm:"primaryKey"`
+	ConsoleAccountID uint64        `gorm:"uniqueIndex;not null;check:chk_web_console_account_links_distinct,web_account_id <> console_account_id"`
+	CreatedAt        time.Time     `gorm:"not null"`
+	WebAccount       *accountModel `gorm:"foreignKey:WebAccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	ConsoleAccount   *accountModel `gorm:"foreignKey:ConsoleAccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+}
+
+func (webConsoleAccountLinkModel) TableName() string { return "web_console_account_links" }
+
 type webAccountProfileModel struct {
-	AccountID uint64 `gorm:"primaryKey"`
-	Tier      string `gorm:"size:16;not null;check:chk_web_account_profiles_tier,tier IN ('auto','basic','super','heavy')"`
-	SyncedAt  *time.Time
-	Account   *accountModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	AccountID            uint64 `gorm:"primaryKey"`
+	Tier                 string `gorm:"size:16;not null;check:chk_web_account_profiles_tier,tier IN ('auto','basic','super','heavy')"`
+	SyncedAt             *time.Time
+	NSFWEnabledAt        *time.Time
+	TermsAcceptedAt      *time.Time
+	TermsAcceptedVersion int `gorm:"not null;default:0"`
+	BirthDateSetAt       *time.Time
+	EgressIdentity       string        `gorm:"size:128;not null;default:'';check:chk_web_account_profiles_egress_identity,length(egress_identity) <= 128"`
+	Account              *accountModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 }
 
 func (webAccountProfileModel) TableName() string { return "web_account_profiles" }
@@ -261,7 +280,7 @@ type requestAuditModel struct {
 	ModelPublicID           string    `gorm:"size:255;check:chk_request_audits_model_public_id,length(model_public_id) <= 255"`
 	ModelUpstreamModel      string    `gorm:"size:255;check:chk_request_audits_model_upstream_model,length(model_upstream_model) <= 255"`
 	Provider                string    `gorm:"size:32;not null;check:chk_request_audits_provider,provider IN ('grok_build','grok_web','grok_console')"`
-	Operation               string    `gorm:"size:32;not null;check:chk_request_audits_operation,operation IN ('responses','chat','messages','image','image_edit','video')"`
+	Operation               string    `gorm:"size:32;not null;check:chk_request_audits_operation,operation IN ('responses','compaction','chat','messages','image','image_edit','video')"`
 	UsageSource             string    `gorm:"size:16;not null;check:chk_request_audits_usage_source,usage_source IN ('upstream','estimated','none')"`
 	AccountID               *uint64   `gorm:"check:chk_request_audits_account_id,account_id IS NULL OR account_id > 0"`
 	AccountName             string    `gorm:"size:160;check:chk_request_audits_account_name,length(account_name) <= 160"`
@@ -354,7 +373,7 @@ type mediaJobModel struct {
 	RequestID       string  `gorm:"size:64;not null;check:chk_media_jobs_request_id,length(request_id) BETWEEN 1 AND 64"`
 	ClientKeyID     uint64  `gorm:"not null;check:chk_media_jobs_client_key_id,client_key_id > 0"`
 	ClientKeyName   string  `gorm:"size:160;not null;default:'';check:chk_media_jobs_client_key_name,length(client_key_name) <= 160"`
-	AccountID       uint64  `gorm:"not null;check:chk_media_jobs_account_id,account_id > 0"`
+	AccountID       *uint64 `gorm:"check:chk_media_jobs_account_id,account_id IS NULL OR account_id > 0"`
 	AccountName     string  `gorm:"size:160;not null;default:'';check:chk_media_jobs_account_name,length(account_name) <= 160"`
 	EgressNodeID    *uint64 `gorm:"check:chk_media_jobs_egress_node_id,egress_node_id IS NULL OR egress_node_id > 0"`
 	EgressNodeName  string  `gorm:"size:160;not null;default:'';check:chk_media_jobs_egress_node_name,length(egress_node_name) <= 160"`
@@ -382,7 +401,7 @@ type mediaJobModel struct {
 	UpdatedAt       time.Time `gorm:"not null"`
 	CompletedAt     *time.Time
 	UsageRecordedAt *time.Time
-	Account         *accountModel   `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
+	Account         *accountModel   `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:SET NULL"`
 	ClientKey       *clientKeyModel `gorm:"foreignKey:ClientKeyID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
 }
 

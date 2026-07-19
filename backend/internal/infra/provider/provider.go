@@ -19,6 +19,7 @@ var (
 	ErrAuthorizationDenied  = errors.New("authorization denied")
 	ErrCredentialLimit      = errors.New("credential count exceeds limit")
 	ErrUnauthorized         = errors.New("upstream credential unauthorized")
+	ErrBirthDateAlreadySet  = errors.New("upstream birth date is already set")
 )
 
 // HTTPStatusError 允许流式或异步 Provider 在无法返回 Response 时保留上游状态码。
@@ -111,7 +112,9 @@ func (e *CredentialRefreshError) Unwrap() error {
 
 // ResponseResourceRequest 表示对 Responses 资源端点的通用上游请求。
 type ResponseResourceRequest struct {
-	Credential     account.Credential
+	Credential account.Credential
+	// Billing 仅用于 Build auto 模式的 XAI 资格判断；nil 表示账号等级尚未确认。
+	Billing        *account.Billing
 	Method         string
 	Path           string
 	Body           []byte
@@ -188,19 +191,23 @@ type DeviceAuthorization struct {
 
 // CredentialSeed 表示登录或导入后尚未持久化的 OAuth 凭据。
 type CredentialSeed struct {
-	Provider          account.Provider
-	AuthType          account.AuthType
-	WebTier           account.WebTier
-	Name              string
-	Email             string
-	UserID            string
-	TeamID            string
-	SourceKey         string
-	OIDCClientID      string
-	AccessToken       string
-	RefreshToken      string
-	CloudflareCookies string
-	ExpiresAt         time.Time
+	Provider                account.Provider
+	AuthType                account.AuthType
+	WebTier                 account.WebTier
+	Name                    string
+	Email                   string
+	UserID                  string
+	TeamID                  string
+	SourceKey               string
+	OIDCClientID            string
+	AccessToken             string
+	RefreshToken            string
+	CloudflareCookies       string
+	ExpiresAt               time.Time
+	WebNSFWEnabledAt        *time.Time
+	WebTermsAcceptedAt      *time.Time
+	WebTermsAcceptedVersion int
+	WebBirthDateSetAt       *time.Time
 }
 
 type QuotaSnapshot struct {
@@ -244,6 +251,8 @@ type ImageEditRequest struct {
 
 type VideoRequest struct {
 	Credential account.Credential
+	// Billing 仅用于 Build auto 模式的 XAI 资格判断；nil 表示账号等级尚未确认。
+	Billing *account.Billing
 	// JobID 绑定本地视频任务，供 XAI ZDR 上传票据与结果资产关联。
 	JobID         string
 	Prompt        string
@@ -283,11 +292,12 @@ type ModelCatalogAdapter interface {
 	ListModels(ctx context.Context, credential account.Credential) ([]string, error)
 }
 
-// AccountModelCapabilityNormalizer 可选：按 Billing 快照归一化账号模型能力。
+// AccountModelCapabilityNormalizer 可选：按 Billing 与 credential entitlement 归一化账号模型能力。
 // 未实现时模型同步原样写入上游目录；billing 为 nil 表示 Unknown（无快照）。
+// credential 用于 Build Super entitlement；默认 Provider 可忽略。
 type AccountModelCapabilityNormalizer interface {
 	Adapter
-	NormalizeAccountModelCapabilities(models []string, billing *account.Billing) []string
+	NormalizeAccountModelCapabilities(models []string, billing *account.Billing, credential account.Credential) []string
 }
 
 type BillingAdapter interface {
@@ -312,6 +322,30 @@ type CredentialCodecAdapter interface {
 	MarshalCredentials(values []CredentialSeed) ([]byte, error)
 }
 
+// CredentialMetadata 是从已保存凭据安全派生的非敏感展示信息。
+// 原始 token 和完整 JWT claims 不得通过该结构暴露。
+type CredentialMetadata struct {
+	BuildBotFlagged bool
+}
+
+type CredentialMetadataAdapter interface {
+	Adapter
+	CredentialMetadata(credential account.Credential) CredentialMetadata
+}
+
+// AccountIdentity 是上游确认的非敏感账号身份元数据。
+// Email 只用于展示；跨 Provider 自动关联仅使用稳定 UserID。
+type AccountIdentity struct {
+	Email  string
+	UserID string
+	TeamID string
+}
+
+type AccountIdentityAdapter interface {
+	Adapter
+	SyncAccountIdentity(ctx context.Context, credential account.Credential) (AccountIdentity, error)
+}
+
 type BuildCredentialConverter interface {
 	Adapter
 	ConvertToBuild(ctx context.Context, credential account.Credential) (CredentialSeed, error)
@@ -321,6 +355,15 @@ type QuotaAdapter interface {
 	Adapter
 	SyncQuota(ctx context.Context, credential account.Credential) (QuotaSnapshot, error)
 	SyncQuotaMode(ctx context.Context, credential account.Credential, mode string) (account.QuotaWindow, error)
+}
+
+// WebAccountSettingsAdapter 定义 Grok Web SSO 账号的上游资料设置能力。
+// 该能力只属于 Web Provider；Build 与 Console 不应通过通用账号逻辑模拟实现。
+type WebAccountSettingsAdapter interface {
+	Adapter
+	AcceptTerms(ctx context.Context, credential account.Credential) error
+	SetBirthDate(ctx context.Context, credential account.Credential, birthDate time.Time) error
+	EnableNSFW(ctx context.Context, credential account.Credential) error
 }
 
 // ImageGenerationAdapter 定义 Provider 可选的图片生成能力。
@@ -633,6 +676,31 @@ func (r *Registry) CredentialCodec(value account.Provider) (CredentialCodecAdapt
 	return result, ok
 }
 
+// CredentialMetadata 返回账号凭据中可安全用于管理端展示的派生信息。
+func (r *Registry) CredentialMetadata(credential account.Credential) CredentialMetadata {
+	if r == nil {
+		return CredentialMetadata{}
+	}
+	adapter, ok := r.adapters[credential.Provider]
+	if !ok {
+		return CredentialMetadata{}
+	}
+	inspector, ok := adapter.(CredentialMetadataAdapter)
+	if !ok {
+		return CredentialMetadata{}
+	}
+	return inspector.CredentialMetadata(credential)
+}
+
+func (r *Registry) AccountIdentity(value account.Provider) (AccountIdentityAdapter, bool) {
+	adapter, ok := r.Get(value)
+	if !ok {
+		return nil, false
+	}
+	result, ok := adapter.(AccountIdentityAdapter)
+	return result, ok
+}
+
 func (r *Registry) BuildConverter(value account.Provider) (BuildCredentialConverter, bool) {
 	adapter, ok := r.Get(value)
 	if !ok {
@@ -648,6 +716,16 @@ func (r *Registry) Quota(value account.Provider) (QuotaAdapter, bool) {
 		return nil, false
 	}
 	result, ok := adapter.(QuotaAdapter)
+	return result, ok
+}
+
+// WebAccountSettings 返回 Grok Web 专属的账号资料设置能力。
+func (r *Registry) WebAccountSettings() (WebAccountSettingsAdapter, bool) {
+	adapter, ok := r.Get(account.ProviderWeb)
+	if !ok {
+		return nil, false
+	}
+	result, ok := adapter.(WebAccountSettingsAdapter)
 	return result, ok
 }
 
