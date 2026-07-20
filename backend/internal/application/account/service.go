@@ -256,6 +256,7 @@ type Service struct {
 	deviceSessions        repository.DeviceSessionRepository
 	sticky                repository.StickySessionRepository
 	refreshLock           repository.DistributedLock
+	concurrency           repository.ConcurrencyLimiter
 	quotaQueue            repository.QuotaRecoveryQueue
 	providers             *provider.Registry
 	cipher                *security.Cipher
@@ -272,6 +273,10 @@ type Service struct {
 	syncPool              *batch.Pool
 	refreshPool           *batch.Pool
 	credentialRefreshWake chan struct{}
+	autoCleanMu           sync.RWMutex
+	autoClean             AutoCleanConfig
+	autoCleanRevision     uint64
+	autoCleanWake         chan struct{}
 	buildBotFlagCache     *resultcache.Cache[string, []uint64]
 	logger                *slog.Logger
 	now                   func() time.Time
@@ -281,6 +286,11 @@ func (s *Service) SetQuotaRecoveryQueue(queue repository.QuotaRecoveryQueue) {
 	s.quotaQueue = queue
 }
 
+// SetConcurrencyLimiter 让账号维护任务读取与推理路由相同的活动租约。
+func (s *Service) SetConcurrencyLimiter(value repository.ConcurrencyLimiter) {
+	s.concurrency = value
+}
+
 func NewService(accounts repository.AccountRepository, audits repository.AuditRepository, deviceSessions repository.DeviceSessionRepository, sticky repository.StickySessionRepository, providers *provider.Registry, cipher *security.Cipher, refreshLock repository.DistributedLock) *Service {
 	return &Service{
 		accounts: accounts, audits: audits, deviceSessions: deviceSessions, sticky: sticky,
@@ -288,8 +298,12 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 		lastRefreshAt: make(map[uint64]time.Time), quotaRefreshes: make(map[string]*webQuotaRefreshState),
 		quotaRefreshQueue:     make(chan webQuotaRefreshRequest, webQuotaRefreshQueueSize),
 		credentialRefreshWake: make(chan struct{}, 1),
-		buildBotFlagCache:     resultcache.New[string, []uint64](1, buildBotFlagCacheTTL),
-		conversionPool:        batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), logger: slog.Default(),
+		autoClean: AutoCleanConfig{
+			Enabled: false, Interval: 10 * time.Minute, MinAge: time.Hour, IncludeDisabled: false,
+		},
+		autoCleanWake:     make(chan struct{}, 1),
+		buildBotFlagCache: resultcache.New[string, []uint64](1, buildBotFlagCacheTTL),
+		conversionPool:    batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), logger: slog.Default(),
 		now: func() time.Time { return time.Now().UTC() },
 	}
 }
@@ -1812,8 +1826,14 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 	} else if errors.Is(refreshErr, context.DeadlineExceeded) {
 		errorCode = "oauth_timeout"
 	}
-	// 永久失败只能由成功换取新 token 清除，后续偶发传输错误不能把状态降级为可重试。
-	permanent = permanent || credential.RefreshPermanent
+	// 真正的 OAuth 永久失败（invalid_grant 等）只能由成功换 token 清除。
+	// credential_decrypt_failed 是可恢复本地错误：不得被旧 permanent 粘住，也不得把本次可恢复失败抬升为永久。
+	if permanent && isRecoverableRefreshErrorCode(errorCode) {
+		permanent = false
+	}
+	if credential.RefreshPermanent && !isRecoverableRefreshErrorCode(credential.LastRefreshErrorCode) && !isRecoverableRefreshErrorCode(errorCode) {
+		permanent = true
+	}
 	now := s.now()
 	retryAt := now.Add(credentialRefreshBackoff(credential.ID, failureCount, retryAfter))
 	accessTokenAlive := credential.EncryptedAccessToken != "" && !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(now)
@@ -1842,8 +1862,14 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 }
 
 // resolvePermanentRefreshFailure 阻止再次请求已确认失效的 refresh token，并在 access token 到期后收敛账号状态。
+// credential_decrypt_failed 属于本地密钥问题，允许手动 force / 调度重试（密钥恢复后可自愈）；
+// invalid_grant 等真正 OAuth 永久失败仍保持阻断。
 func (s *Service) resolvePermanentRefreshFailure(ctx context.Context, credential accountdomain.Credential, now time.Time, force bool) (accountdomain.Credential, error, bool) {
 	if !credential.RefreshPermanent {
+		return accountdomain.Credential{}, nil, false
+	}
+	if isRecoverableRefreshErrorCode(credential.LastRefreshErrorCode) {
+		// 允许 force 或到期调度再次尝试解密/刷新；成功后会 clear permanent 标记。
 		return accountdomain.Credential{}, nil, false
 	}
 	accessTokenAlive := credential.EncryptedAccessToken != "" && !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(now)
@@ -1859,6 +1885,16 @@ func (s *Service) resolvePermanentRefreshFailure(ctx context.Context, credential
 		return accountdomain.Credential{}, ErrCredentialRefreshPermanent, true
 	}
 	return accountdomain.Credential{}, fmt.Errorf("%w: %s", ErrCredentialRefreshPermanent, credential.LastRefreshErrorCode), true
+}
+
+// isRecoverableRefreshErrorCode 标识“永久标记可被后续成功刷新清除”的本地/临时错误。
+func isRecoverableRefreshErrorCode(code string) bool {
+	switch strings.TrimSpace(code) {
+	case "credential_decrypt_failed":
+		return true
+	default:
+		return false
+	}
 }
 
 func credentialRefreshBackoff(accountID uint64, failureCount int, retryAfter time.Duration) time.Duration {
