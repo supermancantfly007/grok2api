@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -46,6 +47,10 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 	if len(input.Prompt) > 100000 || (len(input.Prompt) == 0 && len(input.ReferenceURLs) == 0) {
 		return media.Job{}, fmt.Errorf("文本生视频必须提供 prompt；图片生视频可以省略 prompt")
 	}
+	inputJSON, err := encodeVideoInput(input.ReferenceURLs)
+	if err != nil {
+		return media.Job{}, err
+	}
 	routes, err := s.models.GetByPublicIDCandidates(ctx, input.PublicModel)
 	if err != nil {
 		return media.Job{}, ErrModelNotFound
@@ -76,7 +81,7 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 		AccountID: accountID, AccountName: lease.Credential.Name,
 		Provider: string(route.Provider), Model: externalModel, ModelRouteID: route.ID, UpstreamModel: model.DisplayUpstreamModel(route.Provider, route.UpstreamModel), Prompt: input.Prompt,
 		Seconds: input.Duration, Size: input.AspectRatio, Quality: input.Resolution,
-		Status: media.StatusQueued, Progress: 0, InputJSON: encodeVideoInput(input.ReferenceURLs), CreatedAt: now, UpdatedAt: now,
+		Status: media.StatusQueued, Progress: 0, InputJSON: inputJSON, InputImageCount: len(input.ReferenceURLs), CreatedAt: now, UpdatedAt: now,
 	}
 	reserved := false
 	if pricing, ok := audit.EstimateOfficialVideoCost(externalModel, input.Resolution, input.Duration); ok {
@@ -368,6 +373,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		}
 		failureCancel()
 		applyMediaJobEgress(&job, egressTrace, route.Provider)
+		s.logVideoGenerationFailure(job, lease.Credential, err)
 		failureCode, publicErr := "generation_failed", err
 		if status, ok := provider.ErrorHTTPStatus(err); errors.Is(err, provider.ErrUnauthorized) || (ok && (status == http.StatusUnauthorized || status == http.StatusForbidden)) {
 			failureCode, publicErr = "provider_unavailable", errors.New("上游服务暂不可用")
@@ -488,7 +494,7 @@ func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationM
 		Provider: job.Provider, Operation: audit.OperationVideo, UsageSource: audit.UsageSourceNone,
 		AccountID: accountID, AccountName: job.AccountName, StatusCode: statusCode, ErrorCode: job.ErrorCode,
 		EgressNodeID: job.EgressNodeID, EgressNodeName: job.EgressNodeName, EgressScope: job.EgressScope, EgressMode: audit.EgressMode(job.EgressMode),
-		MediaInputImages: int64(len(decodeVideoInput(job.InputJSON))),
+		MediaInputImages: int64(job.InputImageCount),
 		DurationMS:       durationMS, CreatedAt: createdAt,
 	}
 	if job.Status == media.StatusCompleted {
@@ -513,9 +519,15 @@ func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationM
 	return s.mediaJobs.MarkMediaJobUsageRecorded(markCtx, job.ID, time.Now().UTC())
 }
 
-func encodeVideoInput(referenceURLs []string) string {
-	data, _ := json.Marshal(map[string][]string{"image_urls": referenceURLs})
-	return string(data)
+func encodeVideoInput(referenceURLs []string) (string, error) {
+	data, err := json.Marshal(map[string][]string{"image_urls": referenceURLs})
+	if err != nil {
+		return "", fmt.Errorf("编码视频输入: %w", err)
+	}
+	if len(data) > media.MaxInputJSONBytes {
+		return "", ErrVideoInputTooLarge
+	}
+	return string(data), nil
 }
 
 func decodeVideoInput(value string) []string {
@@ -539,6 +551,30 @@ func (s *Service) failVideoJob(ctx context.Context, job media.Job, code string, 
 		s.logger.Error("video_usage_record_failed", "job_id", job.ID, "event_id", "video_usage_"+job.ID, "error", auditErr)
 	}
 	s.cancelBillingReservation("video_usage_" + job.ID)
+}
+
+func (s *Service) logVideoGenerationFailure(job media.Job, credential account.Credential, err error) {
+	logger := s.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	attributes := []any{
+		"job_id", job.ID,
+		"request_id", job.RequestID,
+		"account_id", credential.ID,
+		"provider", credential.Provider,
+		"model", job.UpstreamModel,
+		"egress_scope", job.EgressScope,
+		"egress_mode", job.EgressMode,
+		"error", sanitizeDiagnosticText(err.Error(), 512),
+	}
+	if status, ok := provider.ErrorHTTPStatus(err); ok {
+		attributes = append(attributes, "upstream_status", status)
+	}
+	if job.EgressNodeID != nil {
+		attributes = append(attributes, "egress_node_id", *job.EgressNodeID, "egress_node_name", job.EgressNodeName)
+	}
+	logger.Warn("video_generation_failed", attributes...)
 }
 
 func (s *Service) deferVideoJob(ctx context.Context, job media.Job) {
