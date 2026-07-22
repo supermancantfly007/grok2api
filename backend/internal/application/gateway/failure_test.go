@@ -56,7 +56,7 @@ func TestRetryableResponseHonorsUpstreamRetryVeto(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(`{"error":"invalid request history"}`)),
 	}
 	if isRetryableResponse(response) {
-		t.Fatal("x-should-retry:false 必须禁止换账号重试")
+		t.Fatal("x-should-retry:false 必须禁止 5xx 换账号重试")
 	}
 	response.Header.Set("X-Should-Retry", "true")
 	if !isRetryableResponse(response) {
@@ -65,5 +65,11 @@ func TestRetryableResponseHonorsUpstreamRetryVeto(t *testing.T) {
 	response.Header.Set("X-Should-Retry", "unknown")
 	if !isRetryableResponse(response) {
 		t.Fatal("未知 x-should-retry 值应按未提供处理")
+	}
+	// 账号级 402：即使上游禁止同凭据重试，仍应允许换号。
+	response.StatusCode = http.StatusPaymentRequired
+	response.Header.Set("X-Should-Retry", "false")
+	if !isRetryableResponse(response) {
+		t.Fatal("402 不得被 x-should-retry:false 阻止换号")
 	}
 }

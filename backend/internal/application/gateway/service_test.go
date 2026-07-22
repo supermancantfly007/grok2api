@@ -692,6 +692,124 @@ func TestParseFreeQuotaExhaustion(t *testing.T) {
 	}
 }
 
+func TestGatewayMarksFreeBuildPaymentRequiredAsQuotaExhausted(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "free-402.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	exhausted, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "free-exhausted", SourceKey: "free-exhausted",
+		EncryptedAccessToken: "exhausted", ExpiresAt: time.Now().Add(time.Hour), Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 200, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthy, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "free-healthy", SourceKey: "free-healthy",
+		EncryptedAccessToken: "healthy", ExpiresAt: time.Now().Add(time.Hour), Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderBuild, []string{"grok-free-402"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []uint64{exhausted.ID, healthy.ID} {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, id, []string{"grok-free-402"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "free-402-key", Prefix: "free402", SecretHash: strings.Repeat("b", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := &freePaymentRequiredAdapter{exhaustedID: exhausted.ID}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+
+	result, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-free-402", ClientKey: clientKey, PublicModel: "grok-free-402",
+		Body: []byte(`{"model":"grok-free-402","input":"hello"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(result.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Finalize(Usage{}, "resp-free-402", "")
+	_ = result.Body.Close()
+	if string(body) != "ok" {
+		t.Fatalf("body = %q", body)
+	}
+	attempts := adapter.Attempts()
+	if len(attempts) != 2 || attempts[0] != exhausted.ID || attempts[1] != healthy.ID {
+		t.Fatalf("attempts = %#v, want exhausted then healthy", attempts)
+	}
+
+	recovery, err := accountRepo.GetQuotaRecovery(ctx, exhausted.ID)
+	if err != nil {
+		t.Fatalf("quota recovery missing for free 402 account: %v", err)
+	}
+	if recovery.Kind != account.QuotaRecoveryKindFree || recovery.Status != account.QuotaRecoveryStatusExhausted {
+		t.Fatalf("recovery = %#v", recovery)
+	}
+	if recovery.NextProbeAt == nil {
+		t.Fatal("free 402 recovery must set NextProbeAt")
+	}
+	wait := time.Until(*recovery.NextProbeAt)
+	if wait < 23*time.Hour || wait > 25*time.Hour {
+		t.Fatalf("NextProbeAt wait = %v, want ~24h", wait)
+	}
+	exhaustedAccount, err := accountRepo.Get(ctx, exhausted.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exhaustedAccount.AuthStatus != account.AuthStatusActive {
+		t.Fatalf("free 402 must not reauth-kick account: %#v", exhaustedAccount)
+	}
+	if exhaustedAccount.CooldownUntil != nil && exhaustedAccount.CooldownUntil.After(time.Now().UTC()) {
+		t.Fatalf("free 402 should use quota recovery, not short health cooldown: %#v", exhaustedAccount)
+	}
+
+	// 后续请求不得再选到 402 已标记耗尽的 Free 账号。
+	adapter.resetAttempts()
+	second, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-free-402-again", ClientKey: clientKey, PublicModel: "grok-free-402",
+		Body: []byte(`{"model":"grok-free-402","input":"hello again"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(second.Body)
+	second.Finalize(Usage{}, "resp-free-402-again", "")
+	_ = second.Body.Close()
+	attempts = adapter.Attempts()
+	if len(attempts) != 1 || attempts[0] != healthy.ID {
+		t.Fatalf("second request attempts = %#v, want only healthy", attempts)
+	}
+}
+
 func TestGatewayExcludesFreeBuildAccountsAfterForbiddenAndTriesAll(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "systemic-forbidden.db"))
@@ -1498,6 +1616,39 @@ func (a *teamModelRateLimitConsoleAdapter) Attempts() []teamModelRateLimitConsol
 	return append([]teamModelRateLimitConsoleAttempt(nil), a.attempts...)
 }
 
+type freePaymentRequiredAdapter struct {
+	mu          sync.Mutex
+	attempts    []uint64
+	exhaustedID uint64
+}
+
+func (a *freePaymentRequiredAdapter) Provider() account.Provider { return account.ProviderBuild }
+func (a *freePaymentRequiredAdapter) Definition() provider.Definition {
+	return testConversationDefinition(account.ProviderBuild)
+}
+func (a *freePaymentRequiredAdapter) ForwardResponse(_ context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
+	a.mu.Lock()
+	a.attempts = append(a.attempts, request.Credential.ID)
+	a.mu.Unlock()
+	if request.Credential.ID == a.exhaustedID {
+		return &provider.Response{
+			StatusCode: http.StatusPaymentRequired, Status: "402 Payment Required", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"error":{"code":"payment_required","message":"Payment Required"}}`)),
+		}, nil
+	}
+	return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok"))}, nil
+}
+func (a *freePaymentRequiredAdapter) Attempts() []uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]uint64(nil), a.attempts...)
+}
+func (a *freePaymentRequiredAdapter) resetAttempts() {
+	a.mu.Lock()
+	a.attempts = nil
+	a.mu.Unlock()
+}
+
 type systemicForbiddenAdapter struct {
 	mu       sync.Mutex
 	attempts []uint64
@@ -1846,4 +1997,116 @@ func testCipher(t *testing.T) *security.Cipher {
 		t.Fatal(err)
 	}
 	return cipher
+}
+
+func TestGatewayFailsOverOnBarePaymentRequiredStreaming(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "stream-402.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	exhausted, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "stream-exhausted", SourceKey: "stream-exhausted",
+		EncryptedAccessToken: "exhausted", ExpiresAt: time.Now().Add(time.Hour), Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 200, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthy, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "stream-healthy", SourceKey: "stream-healthy",
+		EncryptedAccessToken: "healthy", ExpiresAt: time.Now().Add(time.Hour), Enabled: true,
+		AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderBuild, []string{"grok-stream-402"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []uint64{exhausted.ID, healthy.ID} {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, id, []string{"grok-stream-402"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "stream-402-key", Prefix: "s402", SecretHash: strings.Repeat("c", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Match production: bare 402 + personal-team-blocked body, no Diagnostic, streaming request.
+	adapter := &spendingLimit402Adapter{exhaustedID: exhausted.ID}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+
+	result, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-stream-402", ClientKey: clientKey, PublicModel: "grok-stream-402", Streaming: true,
+		Body: []byte(`{"model":"grok-stream-402","input":"hello","stream":true}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after failover", result.StatusCode)
+	}
+	body, err := io.ReadAll(result.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Finalize(Usage{}, "resp-stream-402", "")
+	_ = result.Body.Close()
+	if string(body) != "ok-stream" {
+		t.Fatalf("body = %q", body)
+	}
+	attempts := adapter.Attempts()
+	if len(attempts) != 2 || attempts[0] != exhausted.ID || attempts[1] != healthy.ID {
+		t.Fatalf("attempts = %#v", attempts)
+	}
+}
+
+type spendingLimit402Adapter struct {
+	mu          sync.Mutex
+	attempts    []uint64
+	exhaustedID uint64
+}
+
+func (a *spendingLimit402Adapter) Provider() account.Provider { return account.ProviderBuild }
+func (a *spendingLimit402Adapter) Definition() provider.Definition {
+	return testConversationDefinition(account.ProviderBuild)
+}
+func (a *spendingLimit402Adapter) ForwardResponse(_ context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
+	a.mu.Lock()
+	a.attempts = append(a.attempts, request.Credential.ID)
+	a.mu.Unlock()
+	if request.Credential.ID == a.exhaustedID {
+		// No Diagnostic field — same as Build Responses adapter path for non-success.
+		return &provider.Response{
+			StatusCode: http.StatusPaymentRequired, Status: "402 Payment Required",
+			// 生产上游/CDN 常见：OpenAI 风格头禁止“同请求重试”，但多账号网关仍应换号。
+			Header: http.Header{"Content-Type": {"application/json"}, "Content-Length": {"198"}, "X-Should-Retry": {"false"}},
+			Body: io.NopCloser(strings.NewReader(`{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits or need a Grok subscription."}`)),
+			UpstreamURL: "https://cli-chat-proxy.grok.com/v1/responses",
+		}, nil
+	}
+	return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok-stream"))}, nil
+}
+func (a *spendingLimit402Adapter) Attempts() []uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]uint64(nil), a.attempts...)
 }

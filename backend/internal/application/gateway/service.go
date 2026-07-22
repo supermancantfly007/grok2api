@@ -746,7 +746,14 @@ attemptLoop:
 				s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
 				failureHandled = true
 			} else if lastFailure.QuotaExhausted {
-				failureHandled = s.selector.MarkPaidQuotaExhausted(ctx, credential, lease.Billing)
+				// Free Build 402：按 24h Free 额度耗尽移出号池，避免仅短冷却后反复打到同一账号。
+				// Super/付费仍走账期恢复；无账期时回落 MarkFailure 短冷却。
+				if credential.Provider == accountdomain.ProviderBuild && !accountdomain.IsBuildSuper(credential, lease.Billing) {
+					s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
+					failureHandled = true
+				} else {
+					failureHandled = s.selector.MarkPaidQuotaExhausted(ctx, credential, lease.Billing)
+				}
 			}
 			if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.PermanentAccountDenial {
 				if credential.Provider == accountdomain.ProviderBuild {
@@ -1175,6 +1182,12 @@ func isRetryable(status int) bool {
 func isRetryableResponse(response *provider.Response) bool {
 	if response == nil || !isRetryable(response.StatusCode) {
 		return false
+	}
+	// 账号级 402/403/429：上游 X-Should-Retry:false 表示「勿用同一凭据重试」；
+	// 多账号网关仍须换号。该头仅抑制 5xx 等同请求盲目重试（如 compaction 502）。
+	switch response.StatusCode {
+	case http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests:
+		return true
 	}
 	return !strings.EqualFold(strings.TrimSpace(response.Header.Get("X-Should-Retry")), "false")
 }
